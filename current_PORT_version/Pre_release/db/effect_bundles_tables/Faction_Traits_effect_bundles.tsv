@@ -1,0 +1,47 @@
+key	localised_description	localised_title	ui_icon	bundle_target
+#effect_bundles_tables;1;db/effect_bundles_tables/Faction_Traits_effect_bundles				
+rom_faction_trait_eastern_armenia	The legendary founder of Armenia was Hayk, a chieftain who called on his kinsmen to unite into a single nation, thus forming Armenia.	Kingdom of Armenia	trait_armenia.png	faction
+rom_faction_trait_daco_thracian_odryssia	Odrysian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Odryssia	trait_odryssia.png	faction
+rom_faction_trait_african_masaesyli	Masaesylian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Masaesyli	trait_masaesyli.png	faction
+rom_faction_trait_daco_thracian_getae	Getae strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Getae	trait_getae.png	faction
+rom_faction_trait_celtiberian_cantabri	Cantabrian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Cantabri	trait_edetani.png	faction
+rom_faction_trait_greek_massilia	Massilian strengths lie in its prominent Naval Tradition, extensive Merchant Fleet, and dual Helleno-Latino-Philism.	Massilia	trait_massilia.png	faction
+rom_faction_trait_greek_pergamon	Pergamon strengths lie in Taxation, Homefront Defense, and Melee Defense.	Pergamon	trait_pergamon.png	faction
+rom_faction_trait_greek_ardiaei	Ardiaei strengths lie in their maritime prowess, state piracy, and dependable Illyrian military	Ardiaei	trait_ardiaei.png	faction
+rom_faction_trait_greek_cimmeria	Cimmerian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Cimmeria	trait_cimmeria.png	faction
+rom_faction_trait_lugii	Cimmerian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Cimmeria	trait_lugii.png	faction
+rom_faction_trait_saba	Cimmerian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Cimmeria	trait_saba.png	faction
+rom_faction_trait_nabatea	Cimmerian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Cimmeria	trait_nabatea.png	faction
+rom_faction_trait_african	[DO NOT LOCALISE]	African Kingdoms	trait_african.png	faction
+rom_faction_trait_arabian	[DO NOT LOCALISE]	Arabian Kingdoms	trait_arabian.png	faction
+rom_faction_trait_celtic	[DO NOT LOCALISE]	Celtic Tribes	trait_celtic.png	faction
+rom_faction_trait_etruscan	[DO NOT LOCALISE]	Etruria	trait_etrurian.png	faction
+rom_faction_trait_indian	[DO NOT LOCALISE]	Arabian Kingdoms	trait_indian.png	faction
+rom_faction_trait_arachosia	[DO NOT LOCALISE]	Arabian Kingdoms	trait_arachosia.png	faction
+rom_faction_trait_britannic_cantiaci	[DO NOT LOCALISE]	[DO NOT LOCALISE]	trait_cantiaci.png	faction
+rom_faction_trait_celtiberian_tarbelli	[DO NOT LOCALISE]	[DO NOT LOCALISE]	trait_tarbelli.png	faction
+rom_faction_trait_celtiberian_cig	The tribes of Iberia are fierce warriors who do not back down from a fight.	Iberian Tribes	trait_celtiberian_tribes.png	faction
+rom_faction_trait_greek_rodos	The world-renowned culture of the Greeks was built upon hard toil, keen thinking and military excellence.	Greek States	trait_greek_states.png	faction
+pel_faction_trait_successors_macedon	The Macedonians can trace their heritage beyond Alexander the Great to the mists of antiquity.	Kingdom of Macedon	trait_macedon.png	faction
+pel_faction_trait_rome_cornelia	The Cornelii are among the most illustrious of Roman families, giving rise to more consuls, generals and statesmen than any other.	The House of Cornelia	trait_house_of_cornelia.png	faction
+rom_faction_trait_media_at	[DO NOT LOCALISE]	African Kingdoms	trait_media_at.png	faction
+rom_faction_trait_meroe	[DO NOT LOCALISE]	African Kingdoms	trait_meroe.png	faction
+rom_factions_trait_caledones	[DO NOT LOCALISE]	African Kingdoms	trait_caledones.png	faction
+rom_factions_trait_ebdani	[DO NOT LOCALISE]	African Kingdoms	trait_ebdani.png	faction
+rom_factions_trait_kartli	[DO NOT LOCALISE]	African Kingdoms	trait_kartli.png	faction
+rom_faction_trait_arachosia_vaishya	[DO NOT LOCALISE]	Arabian Kingdoms	trait_arachosia.png	faction
+rom_faction_trait_arachosia_kshatriya	[DO NOT LOCALISE]	Arabian Kingdoms	trait_arachosia.png	faction
+pun_faction_trait_arevaci_GC	The Arevaci are a proud Celtiberian tribe known for their love of horses and fierce resistance.	The Arevaci	trait_arevaci.png	faction
+pun_faction_trait_lusitani_GC	Warriors from Iberia, the Lusitani have a reputation as strong fighters.	The Lusitani	trait_lusitani.png	faction
+pun_faction_trait_syracuse_GC	Home of Archimedes, Syracuse stands proud between two empires.	Syracuse	trait_syracuse.png	faction
+rom_faction_trait_greek_massilia_pel	Massilian strengths lie in its prominent Naval Tradition, extensive Merchant Fleet, and dual Helleno-Latino-Philism.	Massilia	trait_massilia.png	faction
+rom_faction_trait_african_masaesyli_pun	Masaesylian strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Masaesyli	trait_masaesyli.png	faction
+rom_faction_trait_black_sea_pergamon_pel	Pergamon strenghts lie in Taxation, Homefront Defense, and Melee Defense.	Pergamon	trait_pergamon.png	faction
+rom_faction_trait_greek_rodos_pel	The world-renowned culture of the Greeks was built upon hard toil, keen thinking and military excellence.	Greek States	trait_greek_states.png	faction
+rom_faction_trait_cimbri	Cimbri	Cimbri	trait_cimbri.png	faction
+mith_faction_trait_sulla	mith_faction_trait_sulla	mith_faction_trait_sulla	trait_rome.png	faction
+mith_faction_trait_marian	mith_faction_trait_marian	mith_faction_trait_marian	trait_rome.png	faction
+mith_faction_trait_pontus	mith_faction_trait_pontus	mith_faction_trait_pontus	trait_pontus.png	faction
+mith_faction_trait_pontus_group	mith_faction_trait_pontus_group	mith_faction_trait_pontus_group	trait_pontus.png	faction
+mith_faction_trait_rome_group	mith_faction_trait_rome_group	mith_faction_trait_rome_group	trait_rome.png	faction
+smart_diplomacy_war_weary	This faction grows weary of a distant, unwinnable war.	War Weariness	diplomacy_positive.png	faction
