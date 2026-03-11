@@ -16,7 +16,7 @@ local scripting = require "lua_scripts.EpisodicScripting"
 -- distance war blocking
 local WAR_DISTANCE_THRESHOLD = 100
 local RECALC_FREQUENCY = 1
-local LOG_ENABLED = true
+local LOG_ENABLED = false
 
 -- cascading peace
 local CASCADE_PEACE_ENABLED = true
