@@ -2,6 +2,21 @@
 -- Convert an array-style table to a hash set for O(1) lookups.
 -- Used to replace linear-scan contains() calls on static tables.
 
+-- Set to true to enable LogSupply calls. When false, LogSupply is replaced
+-- with a no-op so all logging is skipped (including string concat in args
+-- at the call site — Lua still evaluates args, but the function body is empty).
+local SUPPLY_LOG_ENABLED = false
+
+-- Shadow the global LogSupply with a no-op when logging is disabled.
+-- This avoids the file I/O and formatting inside LogSupply on every call.
+-- String concatenation at call sites still happens, but the function itself
+-- becomes essentially free. To fully eliminate concat cost, wrap individual
+-- calls in `if SUPPLY_LOG_ENABLED then` blocks.
+if not SUPPLY_LOG_ENABLED then
+	local _original_LogSupply = LogSupply
+	LogSupply = function() end
+end
+
 -- Cache for converted sets (so we only convert each table once)
 local _set_cache = {}
 

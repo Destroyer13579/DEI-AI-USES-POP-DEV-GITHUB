@@ -52,6 +52,14 @@ _G.main_env = getfenv(1);
 -- LIBRARIES REQUIRED
 require "lua_scripts.supply_system_script_header";
 
+-- Release mode: override LogSupply with a no-op to eliminate logging overhead.
+-- Set to true to re-enable supply system logging for debugging.
+local SUPPLY_LOG_ENABLED = false
+if not SUPPLY_LOG_ENABLED then
+	local _original_LogSupply = LogSupply
+	LogSupply = function() end
+end
+
 -- global variables
 Nomads_Steal_Food = 0;
 Supply_Message = false;

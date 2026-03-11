@@ -51,7 +51,11 @@ end
 
 local POP_LOG_FILE = "Pop_script_log.txt";
 
+-- Set to false for release builds to eliminate logging overhead
+local MONEY_LOG_ENABLED = false
+
 local function pop_log(line)
+	if not MONEY_LOG_ENABLED then return end
 
 	local ok, f = pcall(io.open, POP_LOG_FILE, "a");
 	if ok and f then
@@ -75,6 +79,14 @@ local ai_money_tracker = {
 	applied_tax_bundle = {}
 };
 
+-- ***** PERFORMANCE: Bundle-change tracking *****
+-- Track the last imperium bundle applied per faction so we skip redundant
+-- remove-all + apply cycles when the imperium level hasn't changed.
+local ai_last_imperium_bundle = {};
+-- Track whether the tax bundle has already been applied per faction
+-- (it's always the same bundle, so we only need to apply it once ever).
+local ai_tax_bundle_applied = {};
+
 -- ************************************************************************
 --
 -- AI FINANCIAL ADJUSTMENTS
@@ -92,9 +104,13 @@ function AdjustAIEconomy(context)
 		-- record start treasury for end-of-turn delta logging
 		ai_money_tracker.turn_start_treasury[factionName] = t_before;
 
-		-- Apply tax bundle (remove first to avoid any chance of stacking weirdness)
-		scripting.game_interface:remove_effect_bundle("AI_Fair_Tax_Boost", factionName);
-		scripting.game_interface:apply_effect_bundle("AI_Fair_Tax_Boost", factionName, 0);
+		-- Only apply tax bundle if we haven't already (it's duration 0 = permanent,
+		-- so it persists across turns and never needs reapplication).
+		if not ai_tax_bundle_applied[factionName] then
+			scripting.game_interface:remove_effect_bundle("AI_Fair_Tax_Boost", factionName);
+			scripting.game_interface:apply_effect_bundle("AI_Fair_Tax_Boost", factionName, 0);
+			ai_tax_bundle_applied[factionName] = true;
+		end
 
 		ai_money_tracker.applied_tax_bundle[factionName] = "AI_Fair_Tax_Boost";
 
@@ -120,49 +136,59 @@ function AdjustAIImperiumBonuses(context)
 	if faction:is_human() == false and faction:region_list():num_items() > 0 then
 		local imp = faction:imperium_level();
 
-		-- remove old unfair money cheats
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_6", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_5", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_4", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_3", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_2", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_1", factionName);
-
-		-- also remove our own bundles so we never stack multiple imperium tiers
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_6", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_5", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_4", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_3", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_2", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_1", factionName);
-		scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_1", factionName);
-
 		-- decide which bundle to apply 
-		local applied = "NONE";
+		local desired = "NONE";
 
 		if imp >= 6 then
-			applied = "AI_Imperium_Fair_Boost_6";
+			desired = "AI_Imperium_Fair_Boost_6";
 		elseif imp == 5 then
-			applied = "AI_Imperium_Fair_Boost_5";
+			desired = "AI_Imperium_Fair_Boost_5";
 		elseif imp == 4 then
-			applied = "AI_Imperium_Bonus_4";
+			desired = "AI_Imperium_Bonus_4";
 		elseif imp == 3 then
-			applied = "AI_Imperium_Bonus_3";
+			desired = "AI_Imperium_Bonus_3";
 		elseif imp == 2 then
-			applied = "AI_Imperium_Bonus_2";
+			desired = "AI_Imperium_Bonus_2";
 		else
-			-- Imperium 1 
-			applied = "AI_Imperium_Bonus_1";
+			desired = "AI_Imperium_Bonus_1";
 		end
 
-		scripting.game_interface:apply_effect_bundle(applied, factionName, 0);
-		ai_money_tracker.applied_bundle[factionName] = applied;
+		-- ***** PERFORMANCE: Only swap bundles if the imperium tier changed *****
+		if ai_last_imperium_bundle[factionName] ~= desired then
+			-- Remove the old bundle (if any) instead of removing all 13
+			local old_bundle = ai_last_imperium_bundle[factionName];
+			if old_bundle and old_bundle ~= "NONE" then
+				scripting.game_interface:remove_effect_bundle(old_bundle, factionName);
+			end
 
-		pop_log("[MONEY_LUA] turn="..Turn()
-			.." event=ImperiumApply"
-			.." faction="..factionName
-			.." imperium="..tostring(imp)
-			.." applied_imperium_bundle="..applied);
+			-- On first run (or after load), clean up any legacy bundles that might exist
+			if not old_bundle then
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_6", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_5", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_4", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_3", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_2", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Bonus_1", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_6", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_5", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_4", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_3", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_2", factionName);
+				scripting.game_interface:remove_effect_bundle("AI_Imperium_Fair_Boost_1", factionName);
+			end
+
+			scripting.game_interface:apply_effect_bundle(desired, factionName, 0);
+			ai_last_imperium_bundle[factionName] = desired;
+
+			pop_log("[MONEY_LUA] turn="..Turn()
+				.." event=ImperiumApply"
+				.." faction="..factionName
+				.." imperium="..tostring(imp)
+				.." applied_imperium_bundle="..desired
+				.." changed_from="..(old_bundle or "FIRST_RUN"));
+		end
+
+		ai_money_tracker.applied_bundle[factionName] = desired;
 	end
 end
 

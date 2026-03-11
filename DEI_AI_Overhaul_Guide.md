@@ -351,3 +351,68 @@ Located under `current_PORT_version/Pre_release/db/`:
 
 **`population.lua`:**
 - `Contains()` function rewritten to use internal `pop_to_set()` with its own `_pop_set_cache`. All callers (`FactionImmigration`, `regionHasPort`) automatically benefit from O(1) lookups without code changes at call sites.
+
+
+### Optimization #2: Hoist Building/Tech Iteration Out of Class Loop in `RegionPopGrowth`
+
+**Problem:** `RegionPopGrowth()` runs a `for i = 1, 4` loop (one per social class). Inside that loop, it iterates all building slots and all researched technologies to compute growth bonuses. Since the buildings and techs are the same for all 4 classes, this means the slot/tech iteration runs 4x unnecessarily — the only difference is which index `[i]` is read from the bonus table.
+
+**Solution:** Hoist both iterations (tech table + building slots) above the class loop. Walk them once, accumulating per-class bonuses into `hoisted_tech_bonus[1..4]` and `hoisted_building_bonus[1..4]`. Inside the class loop, just add the pre-computed values.
+
+**Impact:** For a region with 8 building slots and 20 researched techs, this eliminates ~84 redundant iterations per region per turn. Across 100+ regions, that's significant.
+
+**File:** `population.lua` — `RegionPopGrowth()` function
+
+### Optimization #3: Bundle-Change Tracking in `money.lua`
+
+**Problem:** `AdjustAIImperiumBonuses()` removes 13 effect bundles and applies 1 every turn for every AI faction, even when the imperium level hasn't changed (which is most turns). `AdjustAIEconomy()` removes and re-applies the same permanent tax bundle every turn. Each `remove_effect_bundle` / `apply_effect_bundle` is a game API call with overhead.
+
+**Solution:** 
+- Track `ai_last_imperium_bundle[factionName]` — only swap bundles when the desired bundle differs from what's already applied. On first run after load, do the full 13-bundle cleanup (handles legacy/stale bundles), then only remove the single old bundle on subsequent changes.
+- Track `ai_tax_bundle_applied[factionName]` — the tax bundle is permanent (duration 0), so apply it once and skip on subsequent turns.
+
+**Impact:** Reduces API calls from ~14 per AI faction per turn to 0 in the common case (no imperium change). On first run after load, still does the full cleanup for safety.
+
+**File:** `money.lua` — `AdjustAIEconomy()` and `AdjustAIImperiumBonuses()`
+
+
+### Optimization #4: Release-Mode Logging (No-Op Overrides)
+
+**Problem:** Even when logging flags (`isLogAllowed`, `isLogPopAllowed`) are `false`, every `LogSupply("func_name", "message: "..variable)` call still evaluates its string concatenation arguments before calling the function. With 211 `LogSupply` calls in the supply system (running per-army per-faction per-turn), 42 `LogPop` calls in `RegionPopGrowth` (per-region per-turn), and 260 `PopLog` calls, this is significant wasted work.
+
+**Solution:** When logging is disabled, replace the log functions with empty no-ops (`function() end`) immediately after their definition. This means Lua resolves the function call to an empty body — while string concat at call sites still technically runs, the function dispatch and all internal logic (file I/O, formatting, timestamps) is completely eliminated.
+
+**Files modified:**
+
+- `supply_system_functions.lua` — Added `SUPPLY_LOG_ENABLED = false` flag. When false, shadows the global `LogSupply` with `function() end` after the require.
+- `supply_system.lua` — Same pattern: after `require "lua_scripts.supply_system_script_header"`, overrides `LogSupply` with a no-op when `SUPPLY_LOG_ENABLED = false`.
+- `population.lua` — After defining `LogPop`, `PopLog`, `Debug`, and `Log`, each is replaced with a no-op when its respective flag is false. Uses pre-declared `_LogPop_noop` / `_PopLog_noop` / `_Debug_noop` locals.
+- `money.lua` — Added `MONEY_LOG_ENABLED = false` with early return in `pop_log()`.
+
+**To re-enable logging:** Set the relevant flag to `true`:
+- `SUPPLY_LOG_ENABLED` in `supply_system_functions.lua` and `supply_system.lua`
+- `isLogAllowed` / `isLogPopAllowed` in `population.lua`
+- `MONEY_LOG_ENABLED` in `money.lua`
+
+
+### Optimization #5: Per-Faction Tech Bonus Cache in `population.lua`
+
+**Problem:** `RegionPopGrowth()` is called via `RegionTurnStart` for every region. Inside it, the tech iteration (`has_technology()` for every tech in `tech_pop_growth_own_culture_table` / `tech_pop_growth_foreign_culture_table`) produces identical results for all regions owned by the same faction within the same turn. For a faction with 20 regions and 30 techs in each table, that's ~1200 redundant `has_technology()` API calls per turn.
+
+**Solution:** Added `GetFactionTechBonuses(faction)` which computes and caches `{own={0,0,0,0}, foreign={0,0,0,0}}` per faction name. Cache is invalidated each turn via turn number comparison. `RegionPopGrowth` now reads from the cache instead of iterating techs.
+
+**Impact:** Reduces `has_technology()` calls from O(regions × techs) to O(techs) per faction per turn.
+
+### Optimization #6: Province Capital Helper Function
+
+**Problem:** The 13-call `building_superchain_exists()` check for province capitals is copy-pasted in 3 places: `RegionPopGrowth`, `FactionImmigration`, and `UIRegionPopGrowth`. Each is 13 API calls.
+
+**Solution:** Extracted to `IsProvinceCapital(region)` which iterates a static `_province_capital_superchains` table and short-circuits on first match. All 3 call sites now use the helper. This is primarily a maintainability win (single source of truth), with a minor perf benefit from short-circuit evaluation (average case hits on the first few checks).
+
+### Optimization #7: Foreigner Bundle Tracking in `OnFactionTurnStartPop`
+
+**Problem:** Every turn, for every faction, `OnFactionTurnStartPop` removes 5 foreigner bundles and applies 1 based on the foreign population ratio. The ratio rarely changes between turns, so most of this is wasted API calls.
+
+**Solution:** Added `_last_foreigner_bundle[factionName]` tracking. Only swaps bundles when the desired bundle differs from what's already applied. On first run after load, does the full 5-bundle cleanup for safety.
+
+**File:** `population.lua`
