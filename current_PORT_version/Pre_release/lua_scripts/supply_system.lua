@@ -52,6 +52,14 @@ _G.main_env = getfenv(1);
 -- LIBRARIES REQUIRED
 require "lua_scripts.supply_system_script_header";
 
+-- Release mode: override LogSupply with a no-op to eliminate logging overhead.
+-- Set to true to re-enable supply system logging for debugging.
+local SUPPLY_LOG_ENABLED = false
+if not SUPPLY_LOG_ENABLED then
+	local _original_LogSupply = LogSupply
+	LogSupply = function() end
+end
+
 -- global variables
 Nomads_Steal_Food = 0;
 Supply_Message = false;
@@ -529,8 +537,8 @@ function SupplyCivForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKey
 		-- Step. 4 Winter Regions, Alpine Regions
 		local supply_value_from_table = "none"
 		if season == 3
-		and (contains (region_name, global_supply_variables.winter_regions_table)
-		or contains (region_name, global_supply_variables.alpine_regions_table)) then
+		and (set_contains(to_set(global_supply_variables.winter_regions_table), region_name)
+		or set_contains(to_set(global_supply_variables.alpine_regions_table), region_name)) then
 			LogSupply("SupplyCivForChar()","Start Winter Regions, Alpine Regions check in region for: "..region_name.." Command Queue Index: "..army)
 			supply_effect, supply_value_from_table = WinterAttritionCheck(isAI, curr_char, turns_in_region, supply_usage)
 
@@ -542,8 +550,8 @@ function SupplyCivForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKey
 			end
 		-- Step. 5 Summer Regions, Desert Regions
 		elseif season == 1
-		and (contains (region_name, global_supply_variables.summer_regions_table)
-		or contains (region_name, global_supply_variables.desert_regions_table)) then
+		and (set_contains(to_set(global_supply_variables.summer_regions_table), region_name)
+		or set_contains(to_set(global_supply_variables.desert_regions_table), region_name)) then
 			LogSupply("SupplyCivForChar()","Start Summer Regions, Desert Regions check in region for: "..region_name.." Command Queue Index: "..army)
 			supply_effect, supply_value_from_table = SummerAttritionCheck(isAI, curr_char, turns_in_region, supply_usage)
 
@@ -696,7 +704,7 @@ function SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactio
 		LogSupply("SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Check Supply Cut Winter");
 		-- Supply Cut Winter
 		if season == 3
-		and (contains (region_name, global_supply_variables.winter_regions_table) or contains (region_name, global_supply_variables.alpine_regions_table)) then
+		and (set_contains(to_set(global_supply_variables.winter_regions_table), region_name) or set_contains(to_set(global_supply_variables.alpine_regions_table), region_name)) then
 			LogSupply("SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Supply Cut Winter Regions check in region for: "..region_name.." Command Queue Index: "..army);
 			if Unit_Is_In_Army(curr_char, Baggage_train_list)
 			and turns_in_enemy_regions <=global_supply_variables.supply_values_table[supply_usage.."_nom_Baggage_train_turns"] then
@@ -726,8 +734,8 @@ function SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactio
 		LogSupply("SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Check Supply Cut Summer Regions");
 		-- Summer Regions
 		if season == 1
-		and (contains (region_name, global_supply_variables.summer_regions_table)
-		or contains (region_name, global_supply_variables.desert_regions_table)) then
+		and (set_contains(to_set(global_supply_variables.summer_regions_table), region_name)
+		or set_contains(to_set(global_supply_variables.desert_regions_table), region_name)) then
 			LogSupply("SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Supply Cut Summer Regions check in region for: "..region_name.." Command Queue Index: "..army);
 
 			if Unit_Is_In_Army(curr_char, Baggage_train_list)
@@ -777,7 +785,7 @@ function SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactio
 			and not region_id:garrison_residence():faction():has_food_shortage()
 			and not region_id:garrison_residence():is_under_siege() then
 			LogSupply("SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Start of Barbarian Allies Function for: "..curr_char:get_forename().." Faction Name: "..curr_char:faction():name())
-			if contains(region_id:garrison_residence():faction():name(), AlliedFactionKeys)
+			if AlliedFactionKeys[region_id:garrison_residence():faction():name()]
 			and regional_supplies >= global_supply_variables.supply_values_table["devastated_region"] then
 				LogSupply("SupplyNomadicForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Start of Barbarian Allies Function for: "..curr_char:get_forename().." Faction Name: "..curr_char:faction():name())
 				supply_consumption = math.ceil(army_size*global_supply_variables.supply_values_table[supply_usage.."_nom_allied_region"])
@@ -906,8 +914,8 @@ function SupplyBarForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKey
 		LogSupply("SupplyBarForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Start of Barbarian Supply Cut Winter Function for: "..curr_char:get_forename().." Faction Name: "..curr_char:faction():name())
 
 		if curr_char:faction():subculture() ~= "sc_rom_germanic"
-		and not contains (curr_char:faction():name(), global_supply_variables.winter_factions_list_table)
-		and contains (region_name, global_supply_variables.winter_regions_table)
+		and not set_contains(to_set(global_supply_variables.winter_factions_list_table), curr_char:faction():name())
+		and set_contains(to_set(global_supply_variables.winter_regions_table), region_name)
 		and season == 3 then
 			if isAI
 			and activate_attrition_for_ai == true
@@ -927,7 +935,7 @@ function SupplyBarForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKey
 		-- Supply Cut Summer
 		LogSupply("SupplyBarForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKeys, EnemyFactionKeys)","Start of Barbarian Supply Cut Summer Function for: "..curr_char:get_forename().." Faction Name: "..curr_char:faction():name())
 
-		if contains (region_name, global_supply_variables.summer_regions_table)
+		if set_contains(to_set(global_supply_variables.summer_regions_table), region_name)
 		and season == 1 then
 			if isAI
 			and activate_attrition_for_ai == true
@@ -975,7 +983,7 @@ function SupplyBarForChar(curr_char, SupplyConsumptionOn, isAI, AlliedFactionKey
 		and not region_id:garrison_residence():faction():has_food_shortage()
 		and not region_id:garrison_residence():is_under_siege() then
 
-			if contains(region_id:garrison_residence():faction():name(), AlliedFactionKeys)
+			if AlliedFactionKeys[region_id:garrison_residence():faction():name()]
 				and regional_supplies >= global_supply_variables.supply_values_table["devastated_region"]
 			then
 				RemoveSuppliesBasic(region_name, math.ceil(army_size*global_supply_variables.supply_values_table[supply_usage.."_bar_allied_region"]), SupplyConsumptionOn, true)
@@ -1152,28 +1160,28 @@ local function SupplyOnSettlementSelected(context)
 
 	--function UI_SupplyRetrieveFertility(region_name)
 	-- get region type
-	if contains (region_name, global_supply_variables.low_fertile_regions_table) then
+	if set_contains(to_set(global_supply_variables.low_fertile_regions_table), region_name) then
 		supply_value = math.ceil(global_supply_variables.supply_values_table["low_fertile_regions"]*global_supply_variables.supply_values_table[SeasonToString()])
 		supply_cap = global_supply_variables.supply_values_table["low_fertile_regional_cap"]
 		Supply_System_UI.Region_Fertility = "[[rgba:153:0:0:150]]Low Fertility[[/rgba:153:0:0:150]]"
 		LogSupply("SupplyOnSettlementSelected(context)","supply value: "..supply_value)
 	end
 
-	if contains (region_name, global_supply_variables.normal_regions_table) then
+	if set_contains(to_set(global_supply_variables.normal_regions_table), region_name) then
 		supply_value = math.ceil(global_supply_variables.supply_values_table["normal_regions"]*global_supply_variables.supply_values_table[SeasonToString()])
 		supply_cap = global_supply_variables.supply_values_table["normal_regional_cap"]
 		Supply_System_UI.Region_Fertility = "[[rgba:255:204:51:150]]Average Fertility[[/rgba:255:204:51:150]]"
 		LogSupply("SupplyOnSettlementSelected(context)","supply value: "..supply_value)
 	end
 
-	if contains (region_name, global_supply_variables.fertile_regions_table) then
+	if set_contains(to_set(global_supply_variables.fertile_regions_table), region_name) then
 		supply_value = math.ceil(global_supply_variables.supply_values_table["fertile_regions"]*global_supply_variables.supply_values_table[SeasonToString()])
 		supply_cap = global_supply_variables.supply_values_table["fertile_regional_cap"]
 		Supply_System_UI.Region_Fertility = "[[rgba:0:102:0:150]]High Fertility[[/rgba:0:102:0:150]]"
 		LogSupply("SupplyOnSettlementSelected(context)","supply value: "..supply_value)
 	end
 
-	if contains (region_name, global_supply_variables.very_fertile_regions_table) then
+	if set_contains(to_set(global_supply_variables.very_fertile_regions_table), region_name) then
 		supply_value = math.ceil(global_supply_variables.supply_values_table["very_fertile_regions"]*global_supply_variables.supply_values_table[SeasonToString()])
 		supply_cap = global_supply_variables.supply_values_table["very_fertile_regional_cap"]
 		Supply_System_UI.Region_Fertility = "[[rgba:0:102:0:150]]Very High Fertility[[/rgba:0:102:0:150]]"
@@ -1200,12 +1208,12 @@ local function SupplyOnSettlementSelected(context)
 	end;
 
 	if current_Season() == 1
-	and contains (region_name, global_supply_variables.desert_regions_table) then
+	and set_contains(to_set(global_supply_variables.desert_regions_table), region_name) then
 		supply_value = 0
 	end;
 
 	if current_Season() == 3
-	and contains (region_name, global_supply_variables.winter_regions_table) then
+	and set_contains(to_set(global_supply_variables.winter_regions_table), region_name) then
 		supply_value = 0
 	end;
 

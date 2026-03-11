@@ -74,6 +74,13 @@ triggerload = "nil";
 isLogAllowed = false;
 isLogPopAllowed = false;
 
+-- Release mode: when logging is disabled, replace log functions with no-ops
+-- to eliminate string concatenation overhead at call sites.
+-- Set isLogAllowed/isLogPopAllowed to true above to re-enable.
+local _LogPop_noop = function() end
+local _PopLog_noop = function() end
+local _Debug_noop = function() end
+
 -- 
 -- AI DIPLOMACY - PEACE SEEKING 
 -- 
@@ -658,6 +665,8 @@ function LogPop(ftext, rownum, text, isTitle, isNew)
   
 end;
 
+if not isLogPopAllowed then LogPop = _LogPop_noop end
+
 
 -- ***** POP LOG ***** --
 -- the context is the function name that it is being used in. Enter as a string.
@@ -682,6 +691,8 @@ function PopLog(text, ftext)
   
 end
 
+if not isLogAllowed then PopLog = _PopLog_noop end
+
 
 -- ***** DEBUG ***** --
 -- the context is the function name that it is being used in. Enter as a string.
@@ -705,6 +716,8 @@ function Debug(text, ftext)
   popLog :close()
   
 end
+
+if not isLogAllowed then Debug = _Debug_noop end
 
 
 -- ***** PRINT TABLE ***** --
@@ -994,6 +1007,73 @@ end
 
 -- #####-------------------------
 
+-- Per-faction tech bonus cache. Cleared each turn so we only iterate
+-- has_technology() once per faction instead of once per region.
+-- Key: faction_name, Value: { own = {0,0,0,0}, foreign = {0,0,0,0} }
+local _faction_tech_cache = {}
+local _faction_tech_cache_turn = -1
+
+local function GetFactionTechBonuses(faction)
+  local factionName = faction:name()
+  local currentTurn = scripting.game_interface:model():turn_number()
+
+  -- Invalidate cache at the start of each new turn
+  if currentTurn ~= _faction_tech_cache_turn then
+    _faction_tech_cache = {}
+    _faction_tech_cache_turn = currentTurn
+  end
+
+  if _faction_tech_cache[factionName] then
+    return _faction_tech_cache[factionName]
+  end
+
+  local own = {0, 0, 0, 0}
+  local foreign = {0, 0, 0, 0}
+
+  for k, v in pairs(tech_pop_growth_own_culture_table) do
+    if faction:has_technology(k) then
+      for c = 1, 4 do own[c] = own[c] + v[c] end
+    end
+  end
+
+  for k, v in pairs(tech_pop_growth_foreign_culture_table) do
+    if faction:has_technology(k) then
+      for c = 1, 4 do foreign[c] = foreign[c] + v[c] end
+    end
+  end
+
+  _faction_tech_cache[factionName] = { own = own, foreign = foreign }
+  return _faction_tech_cache[factionName]
+end
+
+-- Province capital superchain list — checked in multiple places.
+local _province_capital_superchains = {
+  "rom_SettlementMajor",
+  "dei_superchain_city_ROME",
+  "dei_superchain_city_PELLA",
+  "dei_superchain_city_CARTHAGE",
+  "dei_superchain_city_SYRACUSE",
+  "dei_superchain_city_ATHENS",
+  "dei_superchain_city_ALEXANDRIA",
+  "dei_superchain_city_PERGAMON",
+  "dei_superchain_city_ANTIOCH",
+  "dei_superchain_city_MASSILIA",
+  "dei_superchain_city_BIBRACTE",
+  "dei_superchain_city_ZARM",
+  "inv_etr_main_city",
+}
+
+local function IsProvinceCapital(region)
+  for _, chain in ipairs(_province_capital_superchains) do
+    if region:building_superchain_exists(chain) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Per-faction foreigner bundle tracking to skip redundant API calls
+local _last_foreigner_bundle = {}
 
 -- ***** REGION POP GROWTH ***** --
 -- contains all adjustments of a regions population and requires the region script interface to be passed to it
@@ -1172,19 +1252,7 @@ function RegionPopGrowth(region)
     
     local provCap = false;
   
-    if (region:building_superchain_exists("rom_SettlementMajor")
-    or region:building_superchain_exists("dei_superchain_city_ROME")
-    or region:building_superchain_exists("dei_superchain_city_PELLA")
-    or region:building_superchain_exists("dei_superchain_city_CARTHAGE")
-    or region:building_superchain_exists("dei_superchain_city_SYRACUSE")
-    or region:building_superchain_exists("dei_superchain_city_ATHENS")
-    or region:building_superchain_exists("dei_superchain_city_ALEXANDRIA")
-    or region:building_superchain_exists("dei_superchain_city_PERGAMON")
-    or region:building_superchain_exists("dei_superchain_city_ANTIOCH")
-    or region:building_superchain_exists("dei_superchain_city_MASSILIA")
-    or region:building_superchain_exists("dei_superchain_city_BIBRACTE")
-	or region:building_superchain_exists("dei_superchain_city_ZARM")
-    or region:building_superchain_exists("inv_etr_main_city"))
+    if IsProvinceCapital(region)
     then
     
       provCap = true;
@@ -1206,6 +1274,48 @@ function RegionPopGrowth(region)
     
     LogPop("RegionPopGrowth(region)", "428", "underSiege:" ..tostring(underSiege)); 
     LogPop("RegionPopGrowth(region)", "429", "region checks done:" ..regionName);
+
+    -- ***** PERFORMANCE: Hoist building & tech iteration out of the class loop *****
+    -- These iterate the same slots/techs for all 4 classes. Compute per-class bonuses once,
+    -- then add them inside the i=1..4 loop via simple array indexing.
+
+    local hoisted_tech_bonus = {0, 0, 0, 0}
+    local hoisted_building_bonus = {0, 0, 0, 0}
+
+    -- Use cached per-faction tech bonuses (computed once per faction per turn)
+    local techBonuses = GetFactionTechBonuses(faction)
+
+    if majorityCulture then
+      for c = 1, 4 do hoisted_tech_bonus[c] = techBonuses.own[c] end
+      -- building growth for own culture
+      for slots = 0, region:slot_list():num_items() - 1 do
+        local slot = region:slot_list():item_at(slots)
+        if slot:has_building() then
+          local buildingName = slot:building():name()
+          LogPop("RegionPopGrowth(region)", "461", "buildingName: "..buildingName)
+          if building_pop_growth_own_culture_table[buildingName] then
+            for c = 1, 4 do
+              hoisted_building_bonus[c] = hoisted_building_bonus[c] + building_pop_growth_own_culture_table[buildingName][c]
+            end
+          end
+        end
+      end
+    else
+      for c = 1, 4 do hoisted_tech_bonus[c] = techBonuses.foreign[c] end
+      -- building growth for foreign culture
+      for slots = 0, region:slot_list():num_items() - 1 do
+        local slot = region:slot_list():item_at(slots)
+        if slot:has_building() then
+          local buildingName = slot:building():name()
+          LogPop("RegionPopGrowth(region)", "481", "buildingName: "..buildingName)
+          if building_pop_growth_foreign_culture_table[buildingName] then
+            for c = 1, 4 do
+              hoisted_building_bonus[c] = hoisted_building_bonus[c] + building_pop_growth_foreign_culture_table[buildingName][c]
+            end
+          end
+        end
+      end
+    end
 
     for i = 1, 4
     do 
@@ -1239,96 +1349,19 @@ function RegionPopGrowth(region)
       
       LogPop("RegionPopGrowth(region)", "444", "+ foodShortage: regionPopModTable["..i.."]: "..tostring(regionPopModTable[i]));
 
-      -- 3) Majority Religion & technology
+      -- 3) Majority Religion & technology + 9) Building growth
+      -- (hoisted above the loop — just apply pre-computed bonuses)
       
       if majorityCulture
       then
-      
         regionPopModTable[i] = regionPopModTable[i] + population_modifier["majority_religion_mod_own"][i];
-        
-        LogPop("RegionPopGrowth(region)", "449", "+ majorityCulture: regionPopModTable["..i.."]: "..tostring(regionPopModTable[i])); 
-        
-        -- tech growth based on culture ???????????!!!!!!!!!! 
-      
-        for k, v in pairs(tech_pop_growth_own_culture_table)
-        do
-        
-          if faction:has_technology(k)
-          then
-          
-            regionPopModTable[i] = regionPopModTable[i] + tech_pop_growth_own_culture_table[k][i]
-          
-          end         
-        end
-        
-        -- 9) building growth majority culture
-        
-        for slots = 0, region:slot_list():num_items() - 1
-        do
-        
-          local slot = region:slot_list():item_at(slots);
-        
-          if slot:has_building()
-          then 
-          
-            local buildingName = slot:building():name();
-            
-            LogPop("RegionPopGrowth(region)", "461", "buildingName: "..buildingName);
-          
-            if building_pop_growth_own_culture_table[buildingName]
-            then
-            
-              regionPopModTable[i] = regionPopModTable[i] + building_pop_growth_own_culture_table[buildingName][i];
-              
-              LogPop("RegionPopGrowth(region)", "464", "+buildingName: regionPopModTable["..i.."]: "..tostring(regionPopModTable[i]));
-            
-            end;
-          end;
-        end;
-        
       else
-      
-        regionPopModTable[i] = regionPopModTable[i] + population_modifier["majority_religion_mod_other"][i]
-        
-        LogPop("RegionPopGrowth(region)", "469", "+ majorityCulture: regionPopModTable["..i.."]: "..tostring(regionPopModTable[i])); 
-      
-        -- tech growth based on culture ???????????!!!!!!!!!! 
-        for k, v in pairs(tech_pop_growth_foreign_culture_table)
-        do
-        
-          if faction:has_technology(k)
-          then
-          
-            regionPopModTable[i] = regionPopModTable[i] + tech_pop_growth_foreign_culture_table[k][i];
-          
-          end; 
-        end;
-        
-        -- 9) building growth minority culture
-        
-        for slots = 0, region:slot_list():num_items() -1
-        do
-        
-          local slot = region:slot_list():item_at(slots)
-        
-          if slot:has_building()
-          then 
-          
-            local buildingName = slot:building():name()
-            
-            LogPop("RegionPopGrowth(region)", "481", "buildingName: "..buildingName);
-          
-            if building_pop_growth_foreign_culture_table[buildingName]
-            then
-            
-              regionPopModTable[i] = regionPopModTable[i] + building_pop_growth_foreign_culture_table[buildingName][i];
-              
-              LogPop("RegionPopGrowth(region)", "484", "+buildingName: regionPopModTable["..i.."]: "..tostring(regionPopModTable[i]));
-            
-            end;
-          end;
-        end;
+        regionPopModTable[i] = regionPopModTable[i] + population_modifier["majority_religion_mod_other"][i];
       end;
+      
+      regionPopModTable[i] = regionPopModTable[i] + hoisted_tech_bonus[i] + hoisted_building_bonus[i];
+      
+      LogPop("RegionPopGrowth(region)", "464", "+ culture/tech/building: regionPopModTable["..i.."]: "..tostring(regionPopModTable[i]));
       
       -- 4) Culture/Religion Bonuses
       
@@ -1606,19 +1639,7 @@ function FactionImmigration(faction)
       
       --2) Province Capitol
       
-      elseif (region:building_superchain_exists("rom_SettlementMajor")
-      or region:building_superchain_exists("dei_superchain_city_ROME")
-      or region:building_superchain_exists("dei_superchain_city_PELLA")
-      or region:building_superchain_exists("dei_superchain_city_CARTHAGE")
-      or region:building_superchain_exists("dei_superchain_city_SYRACUSE")
-      or region:building_superchain_exists("dei_superchain_city_ATHENS")
-      or region:building_superchain_exists("dei_superchain_city_ALEXANDRIA")
-      or region:building_superchain_exists("dei_superchain_city_PERGAMON")
-      or region:building_superchain_exists("dei_superchain_city_ANTIOCH")
-      or region:building_superchain_exists("dei_superchain_city_MASSILIA")
-      or region:building_superchain_exists("dei_superchain_city_BIBRACTE")
-	  or region:building_superchain_exists("dei_superchain_city_ZARM")
-      or region:building_superchain_exists("inv_etr_main_city"))
+      elseif IsProvinceCapital(region)
       then
       
         regionType = 2
@@ -2330,20 +2351,25 @@ end
 
 -- ***** CONTAINED INTO TABLE ***** --
 
+-- Cache for converted sets (so we only convert each table once)
+local _pop_set_cache = {}
+
+-- Converts an array {a, b, c} into a set {[a]=true, [b]=true, [c]=true}.
+-- Results are cached by table identity so repeated calls are free.
+local function pop_to_set(array)
+	if _pop_set_cache[array] then return _pop_set_cache[array] end
+	local set = {}
+	for _, v in ipairs(array) do
+		set[v] = true
+	end
+	_pop_set_cache[array] = set
+	return set
+end
+
 function Contains(table_name, value)
 
-  for k, v in pairs(table_name)
-  do
-  
-    if table_name[k] == value
-    then
-    
-      return true
-    
-    end
-  end
-  
-  return false
+  -- O(1) lookup via cached hash set
+  return pop_to_set(table_name)[value] == true
   
 end
 
@@ -3375,53 +3401,44 @@ function OnFactionTurnStartPop(context)
   local factionForeignRatio = foreign / totalPop
   local factionName = context:faction():name()
 
-  -- remove existing effect bundle
-  for i =1, 5
-  do
-    
-    scripting.game_interface:remove_effect_bundle(faction_foreigner_bundle[i], factionName)
-  
-  end
+  -- Determine which foreigner bundle to apply
+  local desired_bundle = nil
 
-  -- add new effect bundle
-  -- scripting.game_interface:apply_effect_bundle(faction_foreigner_bundle[1], factionName, -1)
-  -- PopLog("Faction bundle to be applied" .. faction_foreigner_bundle[1], "OnFactionTurnStartPop")
-  
   if (factionForeignRatio > 0.9)
   then
-  
-    scripting.game_interface:apply_effect_bundle(faction_foreigner_bundle[1], factionName, 0)
-    
-    PopLog("Faction bundle applied".. faction_foreigner_bundle[1], "OnFactionTurnStartPop")
-    
+    desired_bundle = faction_foreigner_bundle[1]
   elseif (factionForeignRatio > 0.8)
   then
-  
-    scripting.game_interface:apply_effect_bundle(faction_foreigner_bundle[2], factionName, 0)
-    
-    PopLog("Faction bundle applied".. faction_foreigner_bundle[2], "OnFactionTurnStartPop")
-    
+    desired_bundle = faction_foreigner_bundle[2]
   elseif (factionForeignRatio > 0.7)
   then
-  
-    scripting.game_interface:apply_effect_bundle(faction_foreigner_bundle[3], factionName, 0)
-    
-    PopLog("Faction bundle applied".. faction_foreigner_bundle[3], "OnFactionTurnStartPop")
-    
+    desired_bundle = faction_foreigner_bundle[3]
   elseif (factionForeignRatio > 0.6)
   then
-  
-    scripting.game_interface:apply_effect_bundle(faction_foreigner_bundle[4], factionName, 0)
-    
-    PopLog("Faction bundle applied".. faction_foreigner_bundle[4], "OnFactionTurnStartPop")
-    
+    desired_bundle = faction_foreigner_bundle[4]
   elseif (factionForeignRatio > 0.5)
   then
-  
-    scripting.game_interface:apply_effect_bundle(faction_foreigner_bundle[5], factionName, 0)
-    
-    PopLog("Faction bundle applied".. faction_foreigner_bundle[5], "OnFactionTurnStartPop")
-    
+    desired_bundle = faction_foreigner_bundle[5]
+  end
+
+  -- Only swap bundles if the desired one changed
+  if _last_foreigner_bundle[factionName] ~= desired_bundle then
+    -- Remove old bundle (or all on first run after load)
+    local old = _last_foreigner_bundle[factionName]
+    if old then
+      scripting.game_interface:remove_effect_bundle(old, factionName)
+    else
+      for i = 1, 5 do
+        scripting.game_interface:remove_effect_bundle(faction_foreigner_bundle[i], factionName)
+      end
+    end
+
+    if desired_bundle then
+      scripting.game_interface:apply_effect_bundle(desired_bundle, factionName, 0)
+      PopLog("Faction bundle applied".. desired_bundle, "OnFactionTurnStartPop")
+    end
+
+    _last_foreigner_bundle[factionName] = desired_bundle
   end
 end
 
@@ -3587,6 +3604,8 @@ function Log(text, isTitle, isNew)
   logfile:close();
   
 end
+
+if not isLogAllowed then Log = function() end end
 
 
 -- ***** MPLOGPOP ***** --
@@ -6081,19 +6100,7 @@ function UIRegionPopGrowth()
     
     local provCap = false
     
-    if (region:building_superchain_exists("rom_SettlementMajor")
-    or region:building_superchain_exists("dei_superchain_city_ROME")
-    or region:building_superchain_exists("dei_superchain_city_PELLA")
-    or region:building_superchain_exists("dei_superchain_city_CARTHAGE")
-    or region:building_superchain_exists("dei_superchain_city_SYRACUSE")
-    or region:building_superchain_exists("dei_superchain_city_ATHENS")
-    or region:building_superchain_exists("dei_superchain_city_ALEXANDRIA")
-    or region:building_superchain_exists("dei_superchain_city_PERGAMON")
-    or region:building_superchain_exists("dei_superchain_city_ANTIOCH")
-    or region:building_superchain_exists("dei_superchain_city_MASSILIA")
-    or region:building_superchain_exists("dei_superchain_city_BIBRACTE")
-	or region:building_superchain_exists("dei_superchain_city_ZARM")
-    or region:building_superchain_exists("inv_etr_main_city"))
+    if IsProvinceCapital(region)
     then
     
       provCap = true
