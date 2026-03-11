@@ -1,3 +1,27 @@
+-- ***** PERFORMANCE: HASH SET UTILITIES ***** --
+-- Convert an array-style table to a hash set for O(1) lookups.
+-- Used to replace linear-scan contains() calls on static tables.
+
+-- Cache for converted sets (so we only convert each table once)
+local _set_cache = {}
+
+-- Converts an array {a, b, c} into a set {[a]=true, [b]=true, [c]=true}.
+-- Results are cached by table identity so repeated calls are free.
+function to_set(array)
+	if _set_cache[array] then return _set_cache[array] end
+	local set = {}
+	for _, v in ipairs(array) do
+		set[v] = true
+	end
+	_set_cache[array] = set
+	return set
+end
+
+-- O(1) lookup: checks if a value exists in a hash set produced by to_set().
+function set_contains(set, value)
+	return set[value] == true
+end
+
 -- ***** SUPPLY FACTION IS BAR ***** --
 
 function SupplyFactionisBAR(factionCulture)
@@ -14,7 +38,7 @@ end;
 function SupplyFactionisNOMADIC(factionName, factionSubculture)
 	local bool = false;
 	if factionSubculture == "sc_rom_barb_east"
-	or contains(factionName, global_supply_variables.nomadic_factions_table)
+	or set_contains(to_set(global_supply_variables.nomadic_factions_table), factionName)
 	then
 		bool = true;
 	end;
@@ -107,7 +131,7 @@ end;
 -- ***** IS DESERT FACTION ***** --
 function Is_Desert_Faction(faction_name)
 
-	if contains (faction_name, global_supply_variables.desert_factions_list_table) then
+	if set_contains(to_set(global_supply_variables.desert_factions_list_table), faction_name) then
 		return true;
 	else
 		return false;
@@ -119,7 +143,7 @@ function Is_Winter_In_Alps(region)
 	LogSupply("Is_Winter_In_Alps(region)","Winter in Apline region Attrition check: "..region);
 	local bool = false;
 	if current_Season() == 3
-	and contains (region, global_supply_variables.alpine_regions_table)
+	and set_contains(to_set(global_supply_variables.alpine_regions_table), region)
 	then
 		bool = true;
 	end;
@@ -135,7 +159,7 @@ function Desert_Attrition(faction, region)
  	local bool = false;
 	if Is_Desert_Faction(faction) == false
 	and current_Season() == 1
-	and contains (region, global_supply_variables.desert_regions_table)
+	and set_contains(to_set(global_supply_variables.desert_regions_table), region)
 	then
 		bool = true;
 	end;
@@ -413,13 +437,23 @@ Ally_diplomatic_treaty_types =
 "current_treaty_trade_agreement"
 	};
 
+-- Pre-computed hash set for O(1) treaty lookups
+local Ally_diplomatic_treaty_types_set = {
+	["current_treaty_vassal_of_player"] = true,
+	["current_treaty_client_of_player"] = true,
+	["current_treaty_defensive_alliance"] = true,
+	["current_treaty_military_alliance"] = true,
+	["current_treaty_giving_soft_military_access_turns"] = true,
+	["current_treaty_trade_agreement"] = true,
+};
+
 -- ***** SUPPLY GET FACTION TREATIES ***** --
 --Version 3.0. last edit 30.01.2022--
 -- fixed logging for enemy factions
 function SupplyGetFactionTreaties(treaty_details)
 
-	local AlliedFactionKeys = {};
-	local EnemyFactionKeys = {};
+	local AlliedFactionKeys = {};  -- hash set: {[faction_key]=true}
+	local EnemyFactionKeys = {};   -- array (iterated in SupplyLineBlocked/SupplyNearEnemyFleet)
 
 	for faction, details in pairs(treaty_details) do
 		LogSupply("SupplyGetFactionTreaties(treaty_details)","faction: "..tostring(faction));
@@ -427,8 +461,8 @@ function SupplyGetFactionTreaties(treaty_details)
 		for k, treaty in ipairs(details) do
 			LogSupply("SupplyGetFactionTreaties(treaty_details)","treaty_details: "..tostring(treaty));
 
-			if contains(treaty, Ally_diplomatic_treaty_types) then
-				table.insert(AlliedFactionKeys, tostring(faction));
+			if Ally_diplomatic_treaty_types_set[treaty] then
+				AlliedFactionKeys[tostring(faction)] = true;
 				LogSupply("SupplyGetFactionTreaties(treaty_details)","Ally Faction Added: "..tostring(faction));
 			elseif treaty == "current_treaty_at_war" then
 				table.insert(EnemyFactionKeys, tostring(faction));
@@ -489,10 +523,10 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 			LogSupply("BuildSupplyLines()","Searching for Supply Depot in Region 1: "..adjacent_region_name_1);
 
 		if (char_faction == adjacent_region_faction
-		or contains(adjacent_region_faction, AlliedFactionKeys))
+		or AlliedFactionKeys[adjacent_region_faction])
 		and SupplyLineRequirements(adjacent_region, adjacent_region_name_1, char_faction, EnemyFactionKeys)
 			then
-				table.insert(adjacent_list_1, tostring(adjacent_region_name_1))
+				adjacent_list_1[tostring(adjacent_region_name_1)] = true
 				LogSupply("BuildSupplyLines()","Logistic Center/Home Region 1 checking supplies: " ..adjacent_region_name_1);
 		end;
 
@@ -513,9 +547,8 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 
 	if supply_line_1 == false
 		then
-			for i = 1, #adjacent_list_1
+			for adjacent_region_name_1, _ in pairs(adjacent_list_1)
 				do
-					adjacent_region_name_1 = adjacent_list_1[i]
 					local adjacent_region = scripting.game_interface:model():world():region_manager():region_by_key(adjacent_region_name_1)
 					LogSupply("BuildSupplyLines()","Starting Region for Supply Depot in adjacent region 2: " ..adjacent_region_name_1);
 
@@ -527,11 +560,11 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 							LogSupply("BuildSupplyLines()","Searching for Supply Depot in Region 2"..adjacent_region_name_2);
 
 							if (char_faction == two_adjacent_region_faction
-							or contains(two_adjacent_region_faction, AlliedFactionKeys))
-							and not contains(adjacent_region_name_2, adjacent_list_1)
+							or AlliedFactionKeys[two_adjacent_region_faction])
+							and not adjacent_list_1[adjacent_region_name_2]
 							and SupplyLineRequirements(two_adjacent_region, adjacent_region_name_2, char_faction, EnemyFactionKeys)
 							then
-								table.insert(adjacent_list_2, tostring(adjacent_region_name_2))
+								adjacent_list_2[tostring(adjacent_region_name_2)] = true
 							end;
 
 							if char_faction == two_adjacent_region_faction
@@ -555,9 +588,8 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 				and supply_line_2 == false
 				then
 
-					for i = 1, #adjacent_list_1
+					for adjacent_region_name_1, _ in pairs(adjacent_list_1)
 					do
-						adjacent_region_name_1 = adjacent_list_1[i]
 						local adjacent_region = scripting.game_interface:model():world():region_manager():region_by_key(adjacent_region_name_1)
 
 						for h = 0, adjacent_region:adjacent_region_list():num_items() - 1
@@ -565,7 +597,7 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 							local two_adjacent_region = adjacent_region:adjacent_region_list():item_at(h)
 							adjacent_region_name_2 = two_adjacent_region:name()
 
-							if contains(adjacent_region_name_2, adjacent_list_2)
+							if adjacent_list_2[adjacent_region_name_2]
 							then
 
 								for k = 0, two_adjacent_region:adjacent_region_list():num_items() - 1
@@ -577,9 +609,9 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 
 									if char_faction == three_adjacent_region_faction
 									and region_name ~= adjacent_region_name_3
-									and not contains(adjacent_region_name_3, adjacent_list_3)
-									and not contains(adjacent_region_name_3, adjacent_list_2)
-									and not contains(adjacent_region_name_3, adjacent_list_1)
+									and not adjacent_list_3[adjacent_region_name_3]
+									and not adjacent_list_2[adjacent_region_name_3]
+									and not adjacent_list_1[adjacent_region_name_3]
 									and Region_has_Building_by_list(three_adjacent_region, Tier_III_Depot_List)
 									and SupplyLineRequirements(three_adjacent_region, adjacent_region_name_3, char_faction, EnemyFactionKeys)
 									then
@@ -593,16 +625,16 @@ function BuildSupplyLines(region_name, army, curr_char, char_faction, AlliedFact
 											supply_line_region_name_3 = three_adjacent_region:name();
 
 											LogSupply("BuildSupplyLines()","Logistic Center/Home Region at Region 3" ..adjacent_region_name_3);
-											table.insert(adjacent_list_3, tostring(adjacent_region_name_3));
+											adjacent_list_3[tostring(adjacent_region_name_3)] = true;
 											LogSupply("BuildSupplyLines()","Added to adjacent region List 3" ..adjacent_region_name_3);
 											break
 										end;
 
 										if supply_line == false
-										and not contains(adjacent_region_name_3, adjacent_list_3)
+										and not adjacent_list_3[adjacent_region_name_3]
 										then
 											LogSupply("BuildSupplyLines()","Logistic Center too far away Last region name:" ..adjacent_region_name_3);
-											table.insert(adjacent_list_3, tostring(adjacent_region_name_3));
+											adjacent_list_3[tostring(adjacent_region_name_3)] = true;
 											LogSupply("BuildSupplyLines()","Added to adjacent region List 3" ..adjacent_region_name_3);
 										end;
 									end;
@@ -945,7 +977,7 @@ function CivAlliedSupply(region_id, HasMinSupplies, curr_char, AlliedFactionKeys
 	if curr_char:region():garrison_residence():faction():name() ~= curr_char:faction():name()
 	and not region_id:garrison_residence():faction():has_food_shortage()
 	and not region_id:garrison_residence():is_under_siege() then
-		if contains(curr_char:region():garrison_residence():faction():name(), AlliedFactionKeys)
+		if AlliedFactionKeys[curr_char:region():garrison_residence():faction():name()]
 			and HasMinSupplies then
 			bool = true
 		end
@@ -1010,12 +1042,13 @@ end;
 -- renamed function to AgricultureBuildingDamage from agriculture_building_damage
 function AgricultureBuildingDamage(region, number, list)
 	LogSupply("AgricultureBuildingDamage()","Start AgricultureBuildingDamage in region: "..region:name())
+	local list_set = to_set(list)
 	for building_name = 0,region:slot_list():num_items() - 1 do
 		local slot = region:slot_list():item_at(building_name);
 		local argiculture_buidling_name = slot:building():name()
 		local regionname = region:name()
 		if slot:has_building()
-		and contains (slot:building():name(), list)
+		and set_contains(list_set, slot:building():name())
 			then scripting.game_interface:instant_set_building_health_percent(regionname, argiculture_buidling_name, number);
 			LogSupply("AgricultureBuildingDamage()","Building: "..argiculture_buidling_name.." damaged")
 		end;

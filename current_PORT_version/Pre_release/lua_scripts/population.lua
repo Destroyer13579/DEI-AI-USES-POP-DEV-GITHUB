@@ -2330,20 +2330,25 @@ end
 
 -- ***** CONTAINED INTO TABLE ***** --
 
+-- Cache for converted sets (so we only convert each table once)
+local _pop_set_cache = {}
+
+-- Converts an array {a, b, c} into a set {[a]=true, [b]=true, [c]=true}.
+-- Results are cached by table identity so repeated calls are free.
+local function pop_to_set(array)
+	if _pop_set_cache[array] then return _pop_set_cache[array] end
+	local set = {}
+	for _, v in ipairs(array) do
+		set[v] = true
+	end
+	_pop_set_cache[array] = set
+	return set
+end
+
 function Contains(table_name, value)
 
-  for k, v in pairs(table_name)
-  do
-  
-    if table_name[k] == value
-    then
-    
-      return true
-    
-    end
-  end
-  
-  return false
+  -- O(1) lookup via cached hash set
+  return pop_to_set(table_name)[value] == true
   
 end
 
