@@ -1,7 +1,7 @@
 income_allocation_policy_key	strategic_context_key	positive_net_income_survival_rounds	proportion_of_net_income_to_spend	zero_or_negative_net_income_survival_rounds
 #cai_personalities_income_allocation_policy_strategic_context_junctions_tables;0;db/cai_personalities_income_allocation_policy_strategic_context_junctions_tables/DeI_cai_personalities_income_allocation_policy_strategic_context_junctions				
-default	cai_strategic_context_type_last_stand	1	1.0000	3
-default	cai_strategic_context_type_peace	1	0.9000	3
-default	cai_strategic_context_type_tension	1	0.9000	3
-default	cai_strategic_context_type_total_war	1	1.0000	3
-default	cai_strategic_context_type_war	1	1.0000	3
+default	cai_strategic_context_type_last_stand	2	1.0000	5
+default	cai_strategic_context_type_peace	7	0.8000	12
+default	cai_strategic_context_type_tension	5	0.8500	10
+default	cai_strategic_context_type_total_war	3	0.9500	6
+default	cai_strategic_context_type_war	4	0.9000	8

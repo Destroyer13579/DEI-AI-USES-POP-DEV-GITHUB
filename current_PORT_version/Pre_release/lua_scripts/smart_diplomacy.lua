@@ -39,6 +39,8 @@ local THREAT_SIZE_RATIO_CAP = 5.0
 local COALITION_MIN_TURN = 10
 local COALITION_MIN_REGIONS = 7
 local COALITION_COOLDOWN = 10
+local COALITION_FORM_CHANCE_MIN = 0.65   -- minimum random chance for 2nd+ coalition
+local COALITION_FORM_CHANCE_MAX = 0.99   -- maximum random chance for 2nd+ coalition
 local COALITION_INCLUDE_HUMAN = true
 local COALITION_MIN_MEMBERS = 2
 local COALITION_MAX_MEMBERS = 5
@@ -59,6 +61,7 @@ local last_calc = {}
 local coalition_snapshots = {}
 local coalition_snapshot_turn = 0
 local coalition_cooldowns = {}
+local coalition_formation_counts = {}    -- tracks how many coalitions have targeted each faction
 local faction_threat_scores = {}
 local coalition_war_overrides = {}
 local coalition_checked_this_turn = false
@@ -70,6 +73,7 @@ local coalition_ai_notify_queue = {}   -- queued AI coalition notifications [{me
 local coalition_ai_notify_text = ""    -- built text for AI coalition popup
 local coalition_dissolved_text = ""    -- built text for dissolution popup
 local coalition_dissolved_fired = false -- ensures dissolution popup only fires once
+local coalition_new_formation = false  -- true when coalition JUST formed (wars may not be in treaty_details yet)
 
 -- ============================================================================
 -- LOGGING
@@ -278,30 +282,36 @@ end
 local function CheckCascadePeace(ai_faction)
     if not CASCADE_PEACE_ENABLED then return end
     local ai_key = ai_faction:name()
-    local linked_humans = {}
 
+    -- =====================================================================
+    -- PASS 1: This faction is an OVERLORD — cascade peace DOWN to all clients/vassals
+    -- If this faction is at peace with enemy X, but a client is still at war with X, force peace.
+    -- Works for both human and AI clients.
+    -- =====================================================================
+    local clients = {}
     pcall(function()
         local ai_treaties = ai_faction:treaty_details()
         if not ai_treaties then return end
+        local my_regions = ai_faction:region_list():num_items()
         for other_faction, treaty_list in pairs(ai_treaties) do
             local other_key = GetFactionKey(other_faction)
-            if other_key then
-                for _, hkey in ipairs(human_factions) do
-                    if other_key == hkey then
-                        for _, treaty in ipairs(treaty_list) do
-                            -- NOTE: client_of_player means AI IS the humans client (wrong direction)
-                            -- We want treaties where the AI is the OVERLORD
-                            if treaty == "current_treaty_client_state"
-                            or treaty == "current_treaty_vassal" then
-                                linked_humans[hkey] = true
-                                Log("CASCADE: " .. ai_key .. " is overlord of " .. hkey .. " (" .. treaty .. ")")
-                            end
-                            if CASCADE_FROM_ALLIES then
-                                if treaty == "current_treaty_military_alliance"
-                                or treaty == "current_treaty_defensive_alliance" then
-                                    linked_humans[hkey] = true
-                                end
-                            end
+            if other_key and type(treaty_list) == "table" then
+                for _, treaty in ipairs(treaty_list) do
+                    if treaty == "current_treaty_client_state"
+                    or treaty == "current_treaty_client_of_player"
+                    or treaty == "current_treaty_vassal" then
+                        -- Only count as client if they have fewer regions and are not human
+                        local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
+                        if other_fac and not IsHumanFaction(other_key) and other_fac:region_list():num_items() < my_regions then
+                            clients[other_key] = true
+                        end
+                        break
+                    end
+                    if CASCADE_FROM_ALLIES then
+                        if treaty == "current_treaty_military_alliance"
+                        or treaty == "current_treaty_defensive_alliance" then
+                            clients[other_key] = true
+                            break
                         end
                     end
                 end
@@ -309,21 +319,195 @@ local function CheckCascadePeace(ai_faction)
         end
     end)
 
-    if not next(linked_humans) then return end
-    local ai_wars = GetWarsForFaction(ai_key)
+    if next(clients) then
+        local overlord_wars = GetWarsForFaction(ai_key)
+        for client_key, _ in pairs(clients) do
+            -- Never cascade peace on behalf of a human client — they control their own diplomacy
+            if IsHumanFaction(client_key) then
+                Log("CASCADE PEACE: Skipping human client " .. client_key .. " (player controls own diplomacy)")
+            else
+                local client_wars = GetWarsForFaction(client_key)
+                for enemy_key, _ in pairs(client_wars) do
+                    if not overlord_wars[enemy_key] and enemy_key ~= ai_key then
+                        -- Never force peace ON the human player — don't end their wars without consent
+                        if IsHumanFaction(enemy_key) then
+                            Log("CASCADE PEACE: Skipping " .. client_key .. " <-> " .. enemy_key .. " (will not force peace on human player)")
+                        else
+                            -- Block cascade if enemy is a coalition member targeting this client
+                            local is_coalition_member = false
+                            for _, coal in ipairs(active_coalitions) do
+                                if coal.threat_key == client_key then
+                                    for _, member_key in ipairs(coal.members) do
+                                        if member_key == enemy_key then
+                                            is_coalition_member = true
+                                            break
+                                        end
+                                    end
+                                end
+                                if is_coalition_member then break end
+                            end
 
-    for hkey, _ in pairs(linked_humans) do
-        local human_wars = GetWarsForFaction(hkey)
-        for enemy_key, _ in pairs(human_wars) do
-            if not ai_wars[enemy_key] and enemy_key ~= ai_key then
-                pcall(function()
-                    cm:force_make_peace(hkey, enemy_key)
-                end)
-                Log("CASCADE PEACE: forced peace " .. hkey .. " <-> " .. enemy_key
-                    .. " (overlord " .. ai_key .. " is at peace with them)")
+                            if not is_coalition_member then
+                                pcall(function()
+                                    cm:force_make_peace(client_key, enemy_key)
+                                end)
+                                Log("CASCADE PEACE: " .. client_key .. " <-> " .. enemy_key
+                                    .. " (overlord " .. ai_key .. " at peace)")
+                            else
+                                Log("CASCADE PEACE: BLOCKED " .. client_key .. " <-> " .. enemy_key
+                                    .. " (active coalition member vs " .. client_key .. ")")
+                            end
+                        end
+                    end
+                end
             end
         end
     end
+
+    -- =====================================================================
+    -- PASS 2: This faction is a CLIENT — find overlord and inherit their peace
+    -- If the overlord (human or AI) is at peace with enemy X, but this faction
+    -- is still at war with X, force peace. Covers human overlord -> AI client.
+    -- Uses region count: overlord always has more regions than client.
+    -- =====================================================================
+    local overlord_key = nil
+    pcall(function()
+        local my_regions = ai_faction:region_list():num_items()
+        local ai_treaties = ai_faction:treaty_details()
+        if not ai_treaties then return end
+        for other_faction, treaty_list in pairs(ai_treaties) do
+            local other_key = GetFactionKey(other_faction)
+            if other_key and other_key ~= ai_key and type(treaty_list) == "table" then
+                for _, treaty in ipairs(treaty_list) do
+                    if treaty == "current_treaty_client_state"
+                    or treaty == "current_treaty_client_of_player"
+                    or treaty == "current_treaty_vassal" then
+                        -- Only count as overlord if they have MORE regions (we are the client)
+                        local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
+                        if other_fac and other_fac:region_list():num_items() > my_regions then
+                            overlord_key = other_key
+                        end
+                        break
+                    end
+                end
+            end
+            if overlord_key then return end
+        end
+    end)
+
+    if overlord_key then
+        local ai_wars = GetWarsForFaction(ai_key)
+        local overlord_wars = GetWarsForFaction(overlord_key)
+        for enemy_key, _ in pairs(ai_wars) do
+            if not overlord_wars[enemy_key] and enemy_key ~= overlord_key then
+                -- Block cascade if enemy is a coalition member targeting this faction
+                local is_coalition_member = false
+                for _, coal in ipairs(active_coalitions) do
+                    if coal.threat_key == ai_key then
+                        for _, member_key in ipairs(coal.members) do
+                            if member_key == enemy_key then
+                                is_coalition_member = true
+                                break
+                            end
+                        end
+                    end
+                    if is_coalition_member then break end
+                end
+
+                if not is_coalition_member then
+                    pcall(function()
+                        cm:force_make_peace(ai_key, enemy_key)
+                    end)
+                    Log("CASCADE PEACE: " .. ai_key .. " <-> " .. enemy_key
+                        .. " (overlord " .. overlord_key .. " at peace)")
+                else
+                    Log("CASCADE PEACE: BLOCKED " .. ai_key .. " <-> " .. enemy_key
+                        .. " (active coalition member vs " .. ai_key .. ")")
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================================
+-- CLIENT STATE GROWTH CHECK
+-- If a client state grows to within 1 region of their overlord, they break free.
+-- Too powerful to remain a subject. Treaty is dissolved via war/peace cycle.
+-- ============================================================================
+
+local function CheckClientStateGrowth(ai_faction)
+    local ai_key = ai_faction:name()
+    local my_regions = 0
+    pcall(function() my_regions = ai_faction:region_list():num_items() end)
+    if my_regions == 0 then return end
+
+    pcall(function()
+        local treaties = ai_faction:treaty_details()
+        if not treaties then return end
+        for other_faction, treaty_list in pairs(treaties) do
+            local other_key = GetFactionKey(other_faction)
+            if other_key and type(treaty_list) == "table" then
+                local is_client_treaty = false
+                for _, treaty in ipairs(treaty_list) do
+                    if treaty == "current_treaty_client_state"
+                    or treaty == "current_treaty_client_of_player"
+                    or treaty == "current_treaty_vassal" then
+                        is_client_treaty = true
+                        break
+                    end
+                end
+
+                if is_client_treaty then
+                    local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
+                    if other_fac then
+                        local other_regions = other_fac:region_list():num_items()
+
+                        -- Determine who is client and who is overlord
+                        local client_key, overlord_key, client_regions, overlord_regions
+                        if my_regions < other_regions then
+                            -- I am the client, they are the overlord
+                            client_key = ai_key
+                            overlord_key = other_key
+                            client_regions = my_regions
+                            overlord_regions = other_regions
+                        elseif other_regions < my_regions then
+                            -- I am the overlord, they are the client
+                            -- Skip if the client is human — don't break player's treaties
+                            if IsHumanFaction(other_key) then
+                                return
+                            end
+                            client_key = other_key
+                            overlord_key = ai_key
+                            client_regions = other_regions
+                            overlord_regions = my_regions
+                        end
+
+                        -- If client has grown to within 1 region of overlord, break free
+                        if client_key and overlord_key and client_regions >= (overlord_regions - 1) then
+                            Log("CLIENT STATE BREAK: " .. client_key .. " (" .. client_regions .. " regions) outgrew overlord "
+                                .. overlord_key .. " (" .. overlord_regions .. " regions) — breaking free!")
+                            -- War/peace cycle to dissolve all treaties between them
+                            pcall(function()
+                                scripting.game_interface:force_diplomacy(client_key, overlord_key, "war", true, true)
+                                scripting.game_interface:force_diplomacy(overlord_key, client_key, "war", true, true)
+                            end)
+                            pcall(function()
+                                cm:force_declare_war(client_key, overlord_key)
+                            end)
+                            pcall(function()
+                                scripting.game_interface:force_diplomacy(client_key, overlord_key, "peace", true, true)
+                                scripting.game_interface:force_diplomacy(overlord_key, client_key, "peace", true, true)
+                            end)
+                            pcall(function()
+                                cm:force_make_peace(client_key, overlord_key)
+                            end)
+                            Log("CLIENT STATE BREAK: " .. client_key .. " is now independent from " .. overlord_key)
+                        end
+                    end
+                end
+            end
+        end
+    end)
 end
 
 -- ============================================================================
@@ -372,6 +556,42 @@ end
 -- COALITION - FORMATION
 -- ============================================================================
 
+-- Returns a table of faction keys that are client states/vassals of the given faction
+-- Uses region count to determine direction: clients always have fewer regions than overlord
+local function GetClientStates(faction_key)
+    local clients = {}
+    pcall(function()
+        local fac = scripting.game_interface:model():world():faction_by_key(faction_key)
+        if not fac then return end
+        local my_regions = fac:region_list():num_items()
+        local treaties = fac:treaty_details()
+        if not treaties then return end
+        for other_faction, treaty_list in pairs(treaties) do
+            local other_key = GetFactionKey(other_faction)
+            if other_key and type(treaty_list) == "table" then
+                for _, treaty in ipairs(treaty_list) do
+                    if treaty == "current_treaty_client_state"
+                    or treaty == "current_treaty_client_of_player"
+                    or treaty == "current_treaty_vassal" then
+                        -- Only count as client if they have fewer regions (we are the overlord)
+                        -- Never include human player — they control their own wars
+                        local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
+                        if other_fac and not IsHumanFaction(other_key) then
+                            local other_regions = other_fac:region_list():num_items()
+                            if other_regions < my_regions then
+                                table.insert(clients, other_key)
+                                Log("COALITION: " .. other_key .. " is client of " .. faction_key .. " (" .. other_regions .. " vs " .. my_regions .. " regions)")
+                            end
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end)
+    return clients
+end
+
 -- build a valid coalition: members must be within distance threshold of player,
 -- not at war with each other, close to each other geographically
 local function BuildCoalitionMembers(threat_key, candidate_pool, target_min, target_max)
@@ -386,30 +606,61 @@ local function BuildCoalitionMembers(threat_key, candidate_pool, target_min, tar
         if not dominated and IsHumanFaction(candidate_key) then dominated = true end
 
         -- reject factions that are allied/vassal/client state of the threat
+        -- NOTE: treaty_details() is DIRECTIONAL — "current_treaty_client_of_player" means
+        -- the calling faction is the OVERLORD. We must check from both sides.
+
+        -- Check 1: candidate's treaties (catches alliances, and candidate being overlord of threat)
         if not dominated then
-            pcall(function()
+            local ok1, err1 = pcall(function()
                 local candidate_fac = scripting.game_interface:model():world():faction_by_key(candidate_key)
-                if candidate_fac then
-                    local treaties = candidate_fac:treaty_details()
-                    if treaties then
-                        for other_faction, treaty_list in pairs(treaties) do
-                            if other_faction == threat_key and type(treaty_list) == "table" then
-                                for _, treaty in ipairs(treaty_list) do
-                                    if treaty == "current_treaty_military_alliance"
-                                    or treaty == "current_treaty_defensive_alliance"
-                                    or treaty == "current_treaty_client_state"
-                                    or treaty == "current_treaty_vassal" then
-                                        dominated = true
-                                        Log("COALITION: " .. candidate_key .. " rejected - allied/vassal of target " .. threat_key .. " (" .. treaty .. ")")
-                                        break
-                                    end
-                                end
+                if not candidate_fac then return end
+                local treaties = candidate_fac:treaty_details()
+                if not treaties then return end
+                for other_faction, treaty_list in pairs(treaties) do
+                    local other_key = GetFactionKey(other_faction)
+                    if other_key == threat_key and type(treaty_list) == "table" then
+                        for _, treaty in ipairs(treaty_list) do
+                            if treaty == "current_treaty_military_alliance"
+                            or treaty == "current_treaty_defensive_alliance"
+                            or treaty == "current_treaty_client_state"
+                            or treaty == "current_treaty_client_of_player"
+                            or treaty == "current_treaty_vassal" then
+                                dominated = true
+                                Log("COALITION: " .. candidate_key .. " rejected - allied/overlord of target " .. threat_key .. " (" .. treaty .. ")")
+                                break
                             end
-                            if dominated then break end
                         end
                     end
+                    if dominated then break end
                 end
             end)
+            if not ok1 then Log("COALITION: treaty check 1 error for " .. candidate_key .. ": " .. tostring(err1)) end
+        end
+
+        -- Check 2: threat's treaties (catches candidate being a client/vassal OF the threat)
+        if not dominated then
+            local ok2, err2 = pcall(function()
+                local threat_fac = scripting.game_interface:model():world():faction_by_key(threat_key)
+                if not threat_fac then return end
+                local treaties = threat_fac:treaty_details()
+                if not treaties then return end
+                for other_faction, treaty_list in pairs(treaties) do
+                    local other_key = GetFactionKey(other_faction)
+                    if other_key == candidate_key and type(treaty_list) == "table" then
+                        for _, treaty in ipairs(treaty_list) do
+                            if treaty == "current_treaty_client_state"
+                            or treaty == "current_treaty_client_of_player"
+                            or treaty == "current_treaty_vassal" then
+                                dominated = true
+                                Log("COALITION: " .. candidate_key .. " rejected - client/vassal OF target " .. threat_key .. " (" .. treaty .. ")")
+                                break
+                            end
+                        end
+                    end
+                    if dominated then break end
+                end
+            end)
+            if not ok2 then Log("COALITION: treaty check 2 error for " .. candidate_key .. " vs " .. threat_key .. ": " .. tostring(err2)) end
         end
 
         if not dominated then
@@ -536,6 +787,20 @@ local function FormCoalition(threat_key, members, turn)
         end
     end
 
+    -- Client states of the threat fight alongside their overlord
+    local threat_clients = GetClientStates(threat_key)
+    for _, client_key in ipairs(threat_clients) do
+        for _, member_key in ipairs(members) do
+            pcall(function()
+                scripting.game_interface:force_diplomacy(member_key, client_key, "war", true, true)
+            end)
+            pcall(function()
+                cm:force_declare_war(member_key, client_key)
+            end)
+            Log("COALITION WAR: " .. member_key .. " declares war on " .. client_key .. " (client state of " .. threat_key .. ")")
+        end
+    end
+
     -- SET BITTER ENEMIES stance for all members vs threat
    -- SetBitterEnemies(members, threat_key)
 
@@ -545,6 +810,13 @@ local function FormCoalition(threat_key, members, turn)
             scripting.game_interface:force_diplomacy(member_key, threat_key, "peace", false, false)
             scripting.game_interface:force_diplomacy(threat_key, member_key, "peace", false, false)
         end)
+        -- Also lock peace between coalition members and threat's client states
+        for _, client_key in ipairs(threat_clients) do
+            pcall(function()
+                scripting.game_interface:force_diplomacy(member_key, client_key, "peace", false, false)
+                scripting.game_interface:force_diplomacy(client_key, member_key, "peace", false, false)
+            end)
+        end
     end
     local lock_turns = is_ai_target and COALITION_AI_PEACE_LOCK or COALITION_PLAYER_PEACE_LOCK
     Log("COALITION: Peace LOCKED for " .. lock_turns .. " turns (" .. (is_ai_target and "AI vs AI" or "AI vs Player") .. ")")
@@ -565,6 +837,7 @@ local function FormCoalition(threat_key, members, turn)
     if IsHumanFaction(threat_key) then
         coalition_notify_player = true
         coalition_notify_members = member_str
+        coalition_new_formation = true
     else
         -- Queue AI coalition notification for player to see
         table.insert(coalition_ai_notify_queue, {members = member_str, threat = threat_key})
@@ -609,6 +882,21 @@ local function DissolveCoalition(coal_index, reason)
         end)
         Log("COALITION PEACE: " .. member_key .. " <-> " .. coal.threat_key)
         coalition_war_overrides[member_key] = nil
+    end
+
+    -- Peace cascades to threat's client states — they fought alongside their overlord
+    local threat_clients = GetClientStates(coal.threat_key)
+    for _, client_key in ipairs(threat_clients) do
+        for _, member_key in ipairs(coal.members) do
+            pcall(function()
+                scripting.game_interface:force_diplomacy(member_key, client_key, "peace", true, true)
+                scripting.game_interface:force_diplomacy(client_key, member_key, "peace", true, true)
+            end)
+            pcall(function()
+                cm:force_make_peace(member_key, client_key)
+            end)
+            Log("COALITION PEACE: " .. member_key .. " <-> " .. client_key .. " (client state of " .. coal.threat_key .. ")")
+        end
     end
 
     -- ========== UI NOTIFICATION HOOK ==========
@@ -885,17 +1173,40 @@ local function EvaluateCoalitions()
 
             local members = BuildCoalitionMembers(threat.key, candidates, threat.target_min, threat.target_max)
             if members then
-                local old_threat = faction_threat_scores[threat.key] or 0
-                faction_threat_scores[threat.key] = old_threat * THREAT_POST_TRIGGER
-                Log("COALITION THREAT: " .. threat.key .. " reduced after trigger: " .. math.floor(old_threat) .. " -> " .. math.floor(old_threat * THREAT_POST_TRIGGER))
+                -- Probability gate: 1st coalition is guaranteed, 2nd+ rolls random 45-85%
+                local prior_count = coalition_formation_counts[threat.key] or 0
+                local should_form = true
 
-                if IsHumanFaction(threat.key) then
-                    table.insert(pending_player_coalitions, {threat_key = threat.key, members = members, turn = turn})
-                    Log("COALITION: Queued coalition vs " .. threat.key .. " [" .. table.concat(members, ", ") .. "] for player turn start")
-                else
-                    FormCoalition(threat.key, members, turn)
+                if prior_count > 0 then
+                    local form_chance = COALITION_FORM_CHANCE_MIN + (math.random() * (COALITION_FORM_CHANCE_MAX - COALITION_FORM_CHANCE_MIN))
+                    local roll = math.random()
+
+                    if roll > form_chance then
+                        should_form = false
+                        Log("COALITION: Formation vs " .. threat.key .. " FAILED probability gate (roll=" .. string.format("%.2f", roll)
+                            .. " needed<" .. string.format("%.2f", form_chance) .. ", prior=" .. prior_count .. ")")
+                        coalition_cooldowns[threat.key] = turn
+                    else
+                        Log("COALITION: Formation vs " .. threat.key .. " PASSED (roll=" .. string.format("%.2f", roll)
+                            .. " needed<" .. string.format("%.2f", form_chance) .. ", prior=" .. prior_count .. ")")
+                    end
                 end
-                formed_this_cycle = true
+
+                if should_form then
+                    local old_threat = faction_threat_scores[threat.key] or 0
+                    faction_threat_scores[threat.key] = old_threat * THREAT_POST_TRIGGER
+                    Log("COALITION THREAT: " .. threat.key .. " reduced after trigger: " .. math.floor(old_threat) .. " -> " .. math.floor(old_threat * THREAT_POST_TRIGGER))
+
+                    coalition_formation_counts[threat.key] = prior_count + 1
+
+                    if IsHumanFaction(threat.key) then
+                        table.insert(pending_player_coalitions, {threat_key = threat.key, members = members, turn = turn})
+                        Log("COALITION: Queued coalition vs " .. threat.key .. " [" .. table.concat(members, ", ") .. "] for player turn start")
+                    else
+                        FormCoalition(threat.key, members, turn)
+                    end
+                    formed_this_cycle = true
+                end
             else
                 Log("COALITION: Could not form vs " .. threat.key .. " (not enough valid members)")
                 coalition_cooldowns[threat.key] = turn
@@ -931,6 +1242,14 @@ local function SaveCoalitionData(context)
     end
     scripting.game_interface:save_named_value("_coalition_cd_count", cd_count, context)
 
+    local fc_count = 0
+    for k, v in pairs(coalition_formation_counts) do
+        scripting.game_interface:save_named_value("_coalition_fc_key_" .. fc_count, k, context)
+        scripting.game_interface:save_named_value("_coalition_fc_val_" .. fc_count, v, context)
+        fc_count = fc_count + 1
+    end
+    scripting.game_interface:save_named_value("_coalition_fc_count", fc_count, context)
+
     local ts_count = 0
     for k, v in pairs(faction_threat_scores) do
         scripting.game_interface:save_named_value("_coalition_ts_key_" .. ts_count, k, context)
@@ -952,7 +1271,7 @@ local function SaveCoalitionData(context)
         end
     end
 
-    Log("COALITION SAVE: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
+    Log("COALITION SAVE: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. fc_count .. " formation counts, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
 end
 
 local function LoadCoalitionData(context)
@@ -974,6 +1293,14 @@ local function LoadCoalitionData(context)
         local k = scripting.game_interface:load_named_value("_coalition_cd_key_" .. i, "", context)
         local v = scripting.game_interface:load_named_value("_coalition_cd_val_" .. i, 0, context)
         if k ~= "" then coalition_cooldowns[k] = v end
+    end
+
+    coalition_formation_counts = {}
+    local fc_count = scripting.game_interface:load_named_value("_coalition_fc_count", 0, context)
+    for i = 0, fc_count - 1 do
+        local k = scripting.game_interface:load_named_value("_coalition_fc_key_" .. i, "", context)
+        local v = scripting.game_interface:load_named_value("_coalition_fc_val_" .. i, 0, context)
+        if k ~= "" and v > 0 then coalition_formation_counts[k] = v end
     end
 
     faction_threat_scores = {}
@@ -1013,7 +1340,7 @@ local function LoadCoalitionData(context)
     end
 
     coalition_war_overrides = {}
-    Log("COALITION LOAD: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
+    Log("COALITION LOAD: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. fc_count .. " formation counts, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
 end
 
 local function ReapplyCoalitionEffects()
@@ -1165,6 +1492,7 @@ local function CheckFaction(ai_faction)
     checks = checks + 1
 
     CheckCascadePeace(ai_faction)
+    CheckClientStateGrowth(ai_faction)
 
     local dist = GetDistToHuman(ai_faction)
     local is_blocked = blocked_factions[ai_key] or false
@@ -1369,12 +1697,16 @@ local function TryInjectCoalitionText()
                     local clean = CleanFactionName(name)
                     if not IsFactionAlive(name) then
                         table.insert(destroyed_names, clean)
+                    elseif coalition_new_formation then
+                        -- New formation: wars may not be in treaty_details yet, treat all living members as at-war
+                        table.insert(at_war_names, clean)
                     elseif player_key and not AreAtWar(player_key, name) then
                         table.insert(peace_names, clean)
                     else
                         table.insert(at_war_names, clean)
                     end
                 end
+                coalition_new_formation = false  -- clear after first text build
 
                 local turns_left = 0
                 local current_turn = scripting.game_interface:model():turn_number()
@@ -1395,53 +1727,41 @@ local function TryInjectCoalitionText()
 
                 local dynamic_text = ""
                 if turns_left > 0 then
-                    dynamic_text = "Word spreads of your rapid expansion, and certain factions have taken up the duty to stop you themselves!\n\n"
-                    if #at_war_names > 0 then
-                        dynamic_text = dynamic_text
-                            .. "The following factions have united against you:\n"
-                            .. table.concat(at_war_names, ", ") .. "\n\n"
+                    dynamic_text = "A coalition has formed against you!\n\n"
+                        .. "Enemies: " .. table.concat(at_war_names, ", ") .. "\n"
+                    if #destroyed_names > 0 then
+                        dynamic_text = dynamic_text .. "Destroyed: " .. table.concat(destroyed_names, ", ") .. "\n"
                     end
                     if #peace_names > 0 then
-                        dynamic_text = dynamic_text
-                            .. "Peace achieved with:\n"
-                            .. table.concat(peace_names, ", ") .. "\n\n"
+                        dynamic_text = dynamic_text .. "Peace achieved: " .. table.concat(peace_names, ", ") .. "\n"
                     end
-                    if #destroyed_names > 0 then
-                        dynamic_text = dynamic_text
-                            .. "Destroyed:\n"
-                            .. table.concat(destroyed_names, ", ") .. "\n\n"
-                    end
+                    dynamic_text = dynamic_text .. "\n"
+                        .. "Peace LOCKED for " .. turns_left .. " more turn" .. (turns_left > 1 and "s" or "") .. "!\n\n"
                     if progress > 0 then
                         dynamic_text = dynamic_text
-                            .. "Progress: " .. progress .. "/" .. dissolve_threshold .. " needed to disband\n\n"
+                            .. "Progress: " .. progress .. "/" .. dissolve_threshold .. " needed to disband\n"
                     end
                     dynamic_text = dynamic_text
-                        .. "Achieve peace with HALF of the coalition to DISBAND IT!\n\n"
-                        .. "NOTE: Peace will NOT be possible with these nations for " .. turns_left .. " more turn" .. (turns_left > 1 and "s" or "") .. "!"
+                        .. "Achieve peace with HALF to DISBAND the coalition!"
                 else
                     dynamic_text = "The coalition against you persists!\n\n"
                     if #at_war_names > 0 then
-                        dynamic_text = dynamic_text
-                            .. "Still at war with:\n"
-                            .. table.concat(at_war_names, ", ") .. "\n\n"
-                    end
-                    if #peace_names > 0 then
-                        dynamic_text = dynamic_text
-                            .. "Peace achieved with:\n"
-                            .. table.concat(peace_names, ", ") .. "\n\n"
+                        dynamic_text = dynamic_text .. "Still at war: " .. table.concat(at_war_names, ", ") .. "\n"
                     end
                     if #destroyed_names > 0 then
-                        dynamic_text = dynamic_text
-                            .. "Destroyed:\n"
-                            .. table.concat(destroyed_names, ", ") .. "\n\n"
+                        dynamic_text = dynamic_text .. "Destroyed: " .. table.concat(destroyed_names, ", ") .. "\n"
                     end
+                    if #peace_names > 0 then
+                        dynamic_text = dynamic_text .. "Peace achieved: " .. table.concat(peace_names, ", ") .. "\n"
+                    end
+                    dynamic_text = dynamic_text .. "\n"
+                        .. "Peace is now available!\n"
                     if progress > 0 then
                         dynamic_text = dynamic_text
-                            .. "Progress: " .. progress .. "/" .. dissolve_threshold .. " needed to disband\n\n"
+                            .. "Progress: " .. progress .. "/" .. dissolve_threshold .. " needed to disband\n"
                     end
                     dynamic_text = dynamic_text
-                        .. "Peace is now available! Perhaps coin will settle this? Or subjugation!\n\n"
-                        .. "Achieve peace with HALF of the coalition to DISBAND IT!"
+                        .. "Achieve peace with HALF to DISBAND the coalition!"
                 end
 
                 dy_descr:SetStateText(dynamic_text)
@@ -1721,6 +2041,37 @@ end
 -- ============================================================================
 
 Log("smart diplomacy loading...")
+-- ============================================================================
+-- GLOBAL API: Called by population.lua to check if peace is coalition-blocked
+-- Returns true if peace between these two factions would violate an active coalition
+-- ============================================================================
+function IsCoalitionPeaceBlocked(faction_key_a, faction_key_b)
+    for _, coal in ipairs(active_coalitions) do
+        local threat = coal.threat_key
+        local threat_clients = GetClientStates(threat)
+
+        -- Build a set of all "threat side" factions (target + their clients)
+        local threat_side = {[threat] = true}
+        for _, ck in ipairs(threat_clients) do
+            threat_side[ck] = true
+        end
+
+        -- Build a set of all coalition members
+        local member_side = {}
+        for _, mk in ipairs(coal.members) do
+            member_side[mk] = true
+        end
+
+        -- Check if one faction is on the member side and the other on the threat side
+        if (member_side[faction_key_a] and threat_side[faction_key_b])
+        or (member_side[faction_key_b] and threat_side[faction_key_a]) then
+            Log("COALITION LOCK: Peace blocked between " .. faction_key_a .. " and " .. faction_key_b .. " (active coalition vs " .. threat .. ")")
+            return true
+        end
+    end
+    return false
+end
+
 scripting.AddEventCallBack("WorldCreated", OnNewCampaign)
 scripting.AddEventCallBack("LoadingGame", OnLoad)
 scripting.AddEventCallBack("SavingGame", OnSave)

@@ -9947,7 +9947,7 @@ local function AIDiplomacyCheck(faction)
                         local acceptor_momentum = GetWarMomentum(enemy_key, faction_key)
                         
                         -- if in desperate mode (not overextended), only seek peace with enemies they losing to
-                        local dominated_by_enemy = asker_momentum <= AI_MOMENTUM_DESPERATE_THRESHOLD
+                        local dominated_by_enemy = asker_momentum <= -AI_MOMENTUM_DESPERATE_THRESHOLD
                         if not is_overextended and not dominated_by_enemy then
                             -- Skip this enemy... not losing badly enough in desperate mode
                         else
@@ -9991,7 +9991,7 @@ local function AIDiplomacyCheck(faction)
                         end
                         
                         -- DESPERATE PEACE BONU.... Extra bonus if asker is losing badly
-                        if asker_momentum <= AI_MOMENTUM_DESPERATE_THRESHOLD then
+                        if asker_momentum <= -AI_MOMENTUM_DESPERATE_THRESHOLD then
                             local regions_lost = math.abs(asker_momentum)
                             local desperate_bonus = math.floor(regions_lost * AI_MOMENTUM_DESPERATE_BONUS_PER_REGION)
                             combined_score = combined_score + desperate_bonus
@@ -10027,6 +10027,12 @@ local function AIDiplomacyCheck(faction)
         
         -- Try to make peace lol
         for _, candidate in ipairs(peace_candidates) do
+            -- Skip if coalition system has locked peace between these factions
+            if IsCoalitionPeaceBlocked and IsCoalitionPeaceBlocked(faction_key, candidate.key) then
+                if isLogAllowed then
+                    PopLog("AI_DIPLOMACY: " .. faction_key .. " vs " .. candidate.key .. " SKIPPED (coalition peace lock active)", "AIDiplomacyCheck()")
+                end
+            else
             local roll = math.random(1, 100)
             
             if isLogAllowed then
@@ -10063,6 +10069,7 @@ local function AIDiplomacyCheck(faction)
             elseif isLogAllowed then
                 PopLog("AI_DIPLOMACY: " .. candidate.key .. " REJECTED (roll " .. roll .. " > " .. math.floor(candidate.combined_score) .. ")", "AIDiplomacyCheck()")
             end
+            end -- close coalition lock else
         end
         
         if #peace_candidates == 0 and isLogAllowed then
