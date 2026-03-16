@@ -80,8 +80,12 @@ isLogPopAllowed = false;
 
 -- config for the AI making peace
 local AI_DIPLOMACY_WAR_THRESHOLD = 4
-local AI_DIPLOMACY_TREASURY_DESPERATE = 5000
+local AI_DIPLOMACY_TREASURY_DESPERATE = 2500
 local AI_DIPLOMACY_TREASURY_RICH = 50000
+
+-- prolonged war fatigue — lets AI seek peace even with <4 wars if a war drags on
+local AI_DIPLOMACY_LONG_WAR_TURNS = 9       -- war must last this many turns
+local AI_DIPLOMACY_LONG_WAR_TREASURY = 5000 -- treasury must be below this, OR weariness > 0
 
 -- factions that can seek peace per the system
 local AI_DIPLOMACY_FACTIONS = {
@@ -531,6 +535,10 @@ local function GetFactionArmyCount(faction)
 end
 
 -- updates army count and calculates war weariness based on losses
+local AI_WAR_FATIGUE_START = 15   -- turns before time-based weariness kicks in
+local AI_WAR_FATIGUE_PER_TURN = 2 -- weariness gained per turn beyond the threshold
+local AI_WAR_WEARINESS_CAP = 50
+
 local function UpdateFactionWarWeariness(faction)
     local faction_key = faction:name()
     local current_army_count = GetFactionArmyCount(faction)
@@ -544,16 +552,11 @@ local function UpdateFactionWarWeariness(faction)
         local current_weariness = ai_faction_war_weariness[faction_key] or 0
         -- each lost army adds 10 war weariness, caps at 50
         local weariness_gain = armies_lost * 10
-        ai_faction_war_weariness[faction_key] = math.min(current_weariness + weariness_gain, 50)
+        ai_faction_war_weariness[faction_key] = math.min(current_weariness + weariness_gain, AI_WAR_WEARINESS_CAP)
         
         if isLogAllowed then
             PopLog("AI_DIPLOMACY_WEARINESS: " .. faction_key .. " lost" .. armies_lost .. " armies (" .. previous_army_count .. " -> " .. current_army_count .. ") | Weariness: " .. current_weariness .. " -> " .. ai_faction_war_weariness[faction_key], "UpdateFactionWarWeariness()")
         end
-    end
-    
-    -- decay weariness slowly if no losses (by 2 per turn, minimum 0)
-    if armies_lost <= 0 and ai_faction_war_weariness[faction_key] and ai_faction_war_weariness[faction_key] > 0 then
-        ai_faction_war_weariness[faction_key] = math.max(ai_faction_war_weariness[faction_key] - 2, 0)
     end
     
     -- store current army count for next turn comparison
@@ -9872,6 +9875,7 @@ local function AIDiplomacyCheck(faction)
     end
     
     local asker_treasury = faction:treasury()
+    if type(asker_treasury) ~= "number" then asker_treasury = 0 end
     
     -- only now get detailed enemy list (expensive operation)
     local enemy_keys = GetEnemyFactions(faction)
@@ -9883,20 +9887,58 @@ local function AIDiplomacyCheck(faction)
     -- if not overextended, check if losing badly to anyone (momentum-desperate)
     if not is_overextended then
         local has_desperate_enemy = false
+        local has_long_war = false
         for _, enemy_key in ipairs(enemy_keys) do
             local my_momentum = GetWarMomentum(faction_key, enemy_key)
             if my_momentum <= -AI_MOMENTUM_DESPERATE_THRESHOLD then
                 has_desperate_enemy = true
                 break
             end
+            -- Check for prolonged war fatigue
+            local war_key = GetWarStartKey(faction_key, enemy_key)
+            local war_start = ai_war_start_turns[war_key] or current_turn
+            local war_duration = current_turn - war_start
+            if war_duration >= AI_DIPLOMACY_LONG_WAR_TURNS then
+                if asker_treasury < AI_DIPLOMACY_LONG_WAR_TREASURY or (ai_faction_war_weariness[faction_key] or 0) > 0 then
+                    has_long_war = true
+                end
+            end
         end
-        if not has_desperate_enemy then
-            return  -- not overextended AND not losing badly, skip
+        if not has_desperate_enemy and not has_long_war then
+            return  -- not overextended AND not losing badly AND no long wars, skip
         end
     end
     
     -- update war weariness based on army losses
     local asker_weariness = UpdateFactionWarWeariness(faction)
+    
+    -- WAR FATIGUE: add time-based weariness for wars lasting 15+ turns
+    local fatigue_gain = 0
+    for _, enemy_key in ipairs(enemy_keys) do
+        local war_key = GetWarStartKey(faction_key, enemy_key)
+        local war_start = ai_war_start_turns[war_key]
+        if war_start then
+            local war_duration = current_turn - war_start
+            if war_duration > AI_WAR_FATIGUE_START then
+                fatigue_gain = fatigue_gain + AI_WAR_FATIGUE_PER_TURN
+            end
+        end
+    end
+    if fatigue_gain > 0 then
+        local old = asker_weariness
+        asker_weariness = math.min(asker_weariness + fatigue_gain, AI_WAR_WEARINESS_CAP)
+        ai_faction_war_weariness[faction_key] = asker_weariness
+        if isLogAllowed and asker_weariness > old then
+            PopLog("AI_DIPLOMACY_WEARINESS: " .. faction_key .. " war fatigue +" .. fatigue_gain .. " (long wars) | Weariness: " .. old .. " -> " .. asker_weariness, "AIDiplomacyCheck()")
+        end
+    else
+        -- Decay weariness if no army losses AND no long wars (2 per turn)
+        if asker_weariness > 0 then
+            asker_weariness = math.max(asker_weariness - 2, 0)
+            ai_faction_war_weariness[faction_key] = asker_weariness
+        end
+    end
+    
     local asker_desire = CalculatePeaceDesire(asker_wars, asker_treasury, asker_weariness)
     
     -- only log if enabled (avoids string concat when disabled)
@@ -9909,14 +9951,15 @@ local function AIDiplomacyCheck(faction)
         local peace_candidates = {}
         
         for _, enemy_key in ipairs(enemy_keys) do
-            -- check if enemy is in our diplomacy list and not human
+            -- check if enemy is in our diplomacy list (human OR AI)
             if AI_DIPLOMACY_FACTIONS[enemy_key] then
                 -- Get enemy faction 
                 local enemy_faction = cm:model():world():faction_by_key(enemy_key)
                 
                 if enemy_faction 
-                   and not enemy_faction:is_human()
                    and enemy_faction:has_home_region() then
+                    
+                    local enemy_is_human = enemy_faction:is_human()
                     
                     -- check cooldown (both directions - either side attempting peace triggers cooldown for both)
                     local cooldown_key_1 = faction_key .. "_" .. enemy_key
@@ -9927,6 +9970,16 @@ local function AIDiplomacyCheck(faction)
                                         (last_attempt_2 and (current_turn - last_attempt_2) < 7)
                     
                     if not on_cooldown then
+                    -- check coalition peace block (if smart_diplomacy.lua is loaded)
+                    local coal_blocked = false
+                    if IsCoalitionPeaceBlocked then
+                        coal_blocked = IsCoalitionPeaceBlocked(faction_key, enemy_key)
+                        if coal_blocked and isLogAllowed then
+                            PopLog("AI_DIPLOMACY: Skipping " .. enemy_key .. " - coalition peace lock active", "AIDiplomacyCheck()")
+                        end
+                    end
+                    
+                    if not coal_blocked then
                     -- check war duration (must be at war for at least 5 turns)
                     local war_key = GetWarStartKey(faction_key, enemy_key)
                     local war_start = ai_war_start_turns[war_key] or current_turn
@@ -9939,6 +9992,8 @@ local function AIDiplomacyCheck(faction)
                     else
                      local acceptor_wars = CountRealWars(enemy_faction)
                         local acceptor_treasury = enemy_faction:treasury()
+                        -- Safety: ensure treasury is a number (engine can return function ref on edge cases)
+                        if type(acceptor_treasury) ~= "number" then acceptor_treasury = 0 end
                         local acceptor_weariness = GetFactionWarWeariness(enemy_key)
                         local accept_chance = CalculateAcceptanceChance(acceptor_wars, acceptor_treasury, acceptor_weariness)
                         
@@ -9952,26 +10007,34 @@ local function AIDiplomacyCheck(faction)
                             -- Skip this enemy... not losing badly enough in desperate mode
                         else
                         -- WINNING ACCEPTOR PENALTY: If acceptor is winning, less likely to accept
-                        if acceptor_momentum > 0 then
+                        -- (skip for human targets — player decides via dilemma popup)
+                        if not enemy_is_human and acceptor_momentum > 0 then
                             local acceptor_penalty = math.floor(acceptor_momentum * 8)
                             accept_chance = accept_chance - acceptor_penalty
                             if accept_chance < 5 then accept_chance = 5 end
                         end
                         
-                        local combined_score = math.floor((asker_desire + accept_chance) / 2)
+                        local combined_score
+                        if enemy_is_human then
+                            -- HUMAN TARGET: Player decides acceptance via popup, so the roll
+                            -- only determines if the AI bothers to ASK. Weight heavily toward asker desire.
+                            combined_score = math.floor(asker_desire * 0.85)
+                        else
+                            combined_score = math.floor((asker_desire + accept_chance) / 2)
+                        end
                         
-                        -- bonus if BOTH struggling
-                        if asker_wars >= 3 and acceptor_wars >= 3 then
+                        -- bonus if BOTH struggling (AI vs AI only — player decides for themselves)
+                        if not enemy_is_human and asker_wars >= 3 and acceptor_wars >= 3 then
                             combined_score = combined_score + 15
                         end
                         
-                        -- Bonus if BOTH broke
-                        if asker_treasury < AI_DIPLOMACY_TREASURY_DESPERATE and acceptor_treasury < AI_DIPLOMACY_TREASURY_DESPERATE then
+                        -- Bonus if BOTH broke (AI vs AI only)
+                        if not enemy_is_human and asker_treasury < AI_DIPLOMACY_TREASURY_DESPERATE and acceptor_treasury < AI_DIPLOMACY_TREASURY_DESPERATE then
                             combined_score = combined_score + 10
                         end
                         
-                        -- bonus if BOTH have high war weariness from losses
-                        if asker_weariness >= 20 and acceptor_weariness >= 20 then
+                        -- bonus if BOTH have high war weariness from losses (AI vs AI only)
+                        if not enemy_is_human and asker_weariness >= 20 and acceptor_weariness >= 20 then
                             combined_score = combined_score + 10
                         end
                         
@@ -9986,7 +10049,7 @@ local function AIDiplomacyCheck(faction)
                         if asker_momentum < 0 then
                             combined_score = combined_score + (math.abs(asker_momentum) * 5)
                         end
-                        if acceptor_momentum < 0 then
+                        if acceptor_momentum < 0 and not enemy_is_human then
                             combined_score = combined_score + (math.abs(acceptor_momentum) * 5)
                         end
                         
@@ -10008,11 +10071,13 @@ local function AIDiplomacyCheck(faction)
                             acceptor_weariness = acceptor_weariness,
                             combined_score = combined_score,
                             asker_momentum = asker_momentum,
-                            acceptor_momentum = acceptor_momentum
+                            acceptor_momentum = acceptor_momentum,
+                            is_human = enemy_is_human
                         })
                         end  -- end desperate mode else
                         end  -- end war_duration check
-                    end
+                    end  -- end coal_blocked check
+                    end  -- end cooldown check
                 end
             end
         end
@@ -10027,12 +10092,6 @@ local function AIDiplomacyCheck(faction)
         
         -- Try to make peace lol
         for _, candidate in ipairs(peace_candidates) do
-            -- Skip if coalition system has locked peace between these factions
-            if IsCoalitionPeaceBlocked and IsCoalitionPeaceBlocked(faction_key, candidate.key) then
-                if isLogAllowed then
-                    PopLog("AI_DIPLOMACY: " .. faction_key .. " vs " .. candidate.key .. " SKIPPED (coalition peace lock active)", "AIDiplomacyCheck()")
-                end
-            else
             local roll = math.random(1, 100)
             
             if isLogAllowed then
@@ -10047,6 +10106,26 @@ local function AIDiplomacyCheck(faction)
             end
             
             if roll <= candidate.combined_score then
+                
+                if candidate.is_human then
+                    -- HUMAN TARGET: Route through dilemma popup instead of forcing peace
+                    PopLog("AI_DIPLOMACY: *** PEACE OFFER TO PLAYER *** " .. faction_key .. " -> " .. candidate.key .. 
+                           " (wars: " .. asker_wars .. ", combined=" .. math.floor(candidate.combined_score) .. ", roll=" .. roll .. ")", "AIDiplomacyCheck()")
+                    
+                    -- Call the global function in smart_diplomacy.lua
+                    if RequestPeaceWithPlayer then
+                        RequestPeaceWithPlayer(faction_key, candidate.key)
+                    else
+                        PopLog("AI_DIPLOMACY: WARNING - RequestPeaceWithPlayer not found (smart_diplomacy.lua not loaded?)", "AIDiplomacyCheck()")
+                    end
+                    
+                    -- Set cooldown so this AI doesn't spam peace offers
+                    ai_diplomacy_cooldowns[faction_key .. "_" .. candidate.key] = current_turn
+                    ai_diplomacy_cooldowns[candidate.key .. "_" .. faction_key] = current_turn
+                    
+                    return
+                end
+                
                 PopLog("AI_DIPLOMACY: *** PEACE TREATY *** " .. faction_key .. " <-> " .. candidate.key .. 
                        " (wars: " .. asker_wars .. " vs " .. candidate.acceptor_wars .. ")", "AIDiplomacyCheck()")
                 
@@ -10069,11 +10148,10 @@ local function AIDiplomacyCheck(faction)
             elseif isLogAllowed then
                 PopLog("AI_DIPLOMACY: " .. candidate.key .. " REJECTED (roll " .. roll .. " > " .. math.floor(candidate.combined_score) .. ")", "AIDiplomacyCheck()")
             end
-            end -- close coalition lock else
         end
         
         if #peace_candidates == 0 and isLogAllowed then
-            PopLog("AI_DIPLOMACY: " .. faction_key .. " found no valid peace candidates (enemies not in diplomacy list or human)", "AIDiplomacyCheck()")
+            PopLog("AI_DIPLOMACY: " .. faction_key .. " found no valid peace candidates (enemies not in diplomacy list, cooldown, or war too short)", "AIDiplomacyCheck()")
         end
     end)
     

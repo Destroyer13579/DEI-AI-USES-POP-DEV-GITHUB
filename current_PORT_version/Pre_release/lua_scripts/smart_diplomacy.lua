@@ -75,6 +75,27 @@ local coalition_dissolved_text = ""    -- built text for dissolution popup
 local coalition_dissolved_fired = false -- ensures dissolution popup only fires once
 local coalition_new_formation = false  -- true when coalition JUST formed (wars may not be in treaty_details yet)
 
+-- peace offer dilemma system (AI offers peace to player via popup)
+local pending_player_peace_offers = {}   -- queued offers: [{asker_key, player_key, turn}]
+local awaiting_peace_response = nil       -- active dilemma waiting for response: {asker_key, player_key, turn}
+local PLAYER_PEACE_DILEMMA_COOLDOWN = 5   -- min turns between peace offer popups
+local last_peace_dilemma_turn = 0
+local peace_offer_dilemma_text = ""       -- dynamic text to inject into dilemma popup
+local peace_offer_player_choice = nil     -- nil=pending, true=accepted, false=refused (set by event listener)
+local dilemma_listener_registered = false
+local dilemma_listener_available = false  -- true if DilemmaChoiceMadeEvent exists
+
+-- coalition invite dilemma system (player gets invited to join AI coalitions)
+local pending_coalition_invite = nil       -- {threat_key, members, turn, player_key} — deferred coalition waiting for player response
+local coalition_invite_player_choice = nil -- nil=pending, true=joined, false=declined (set by click detection)
+local coalition_invite_dilemma_text = ""   -- dynamic text for coalition invite popup
+local coalition_invite_dilemma_fired = false -- true after dilemma has been shown this cycle
+local coalition_player_joined_notify = nil  -- {threat_key, members} — queued "you joined!" notification
+local coalition_player_joined_title_override = false  -- when true, TryInjectCoalitionText overrides title
+local coalition_player_dissolved_title_override = false  -- when true, dissolution popup says "YOUR COALITION DISSOLVED"
+local COALITION_PLAYER_INVITE_COOLDOWN = 10  -- min turns between coalition invites to the player
+local last_coalition_invite_turn = 0         -- turn when player last left or was invited to a coalition
+
 -- ============================================================================
 -- LOGGING
 -- ============================================================================
@@ -299,7 +320,8 @@ local function CheckCascadePeace(ai_faction)
                 for _, treaty in ipairs(treaty_list) do
                     if treaty == "current_treaty_client_state"
                     or treaty == "current_treaty_client_of_player"
-                    or treaty == "current_treaty_vassal" then
+                    or treaty == "current_treaty_vassal"
+                    or treaty == "current_treaty_vassal_of_player" then
                         -- Only count as client if they have fewer regions and are not human
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
                         if other_fac and not IsHumanFaction(other_key) and other_fac:region_list():num_items() < my_regions then
@@ -381,7 +403,8 @@ local function CheckCascadePeace(ai_faction)
                 for _, treaty in ipairs(treaty_list) do
                     if treaty == "current_treaty_client_state"
                     or treaty == "current_treaty_client_of_player"
-                    or treaty == "current_treaty_vassal" then
+                    or treaty == "current_treaty_vassal"
+                    or treaty == "current_treaty_vassal_of_player" then
                         -- Only count as overlord if they have MORE regions (we are the client)
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
                         if other_fac and other_fac:region_list():num_items() > my_regions then
@@ -451,7 +474,8 @@ local function CheckClientStateGrowth(ai_faction)
                 for _, treaty in ipairs(treaty_list) do
                     if treaty == "current_treaty_client_state"
                     or treaty == "current_treaty_client_of_player"
-                    or treaty == "current_treaty_vassal" then
+                    or treaty == "current_treaty_vassal"
+                    or treaty == "current_treaty_vassal_of_player" then
                         is_client_treaty = true
                         break
                     end
@@ -572,7 +596,8 @@ local function GetClientStates(faction_key)
                 for _, treaty in ipairs(treaty_list) do
                     if treaty == "current_treaty_client_state"
                     or treaty == "current_treaty_client_of_player"
-                    or treaty == "current_treaty_vassal" then
+                    or treaty == "current_treaty_vassal"
+                    or treaty == "current_treaty_vassal_of_player" then
                         -- Only count as client if they have fewer regions (we are the overlord)
                         -- Never include human player — they control their own wars
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
@@ -604,6 +629,38 @@ local function BuildCoalitionMembers(threat_key, candidate_pool, target_min, tar
         if not dominated and IsSlaveFaction(candidate_key) then dominated = true end
         if not dominated and IsInAnyCoalition(candidate_key) then dominated = true end
         if not dominated and IsHumanFaction(candidate_key) then dominated = true end
+        
+        -- reject factions that are vassal/client of any human player
+        -- Check from the HUMAN side because treaty_details() is directional
+        -- (player sees "vassal_of_player", but satrapy may see different string)
+        if not dominated then
+            pcall(function()
+                local hkeys = GetHumans()
+                for _, hkey in ipairs(hkeys) do
+                    local hfac = scripting.game_interface:model():world():faction_by_key(hkey)
+                    if hfac then
+                        local treaties = hfac:treaty_details()
+                        if treaties then
+                            for other_faction, treaty_list in pairs(treaties) do
+                                local okey = GetFactionKey(other_faction)
+                                if okey == candidate_key and type(treaty_list) == "table" then
+                                    for _, treaty in ipairs(treaty_list) do
+                                        if treaty == "current_treaty_vassal_of_player"
+                                        or treaty == "current_treaty_client_of_player" then
+                                            dominated = true
+                                            Log("COALITION: " .. candidate_key .. " rejected - vassal/client of human " .. hkey .. " (" .. treaty .. ")")
+                                            break
+                                        end
+                                    end
+                                end
+                                if dominated then break end
+                            end
+                        end
+                    end
+                    if dominated then break end
+                end
+            end)
+        end
 
         -- reject factions that are allied/vassal/client state of the threat
         -- NOTE: treaty_details() is DIRECTIONAL — "current_treaty_client_of_player" means
@@ -624,7 +681,8 @@ local function BuildCoalitionMembers(threat_key, candidate_pool, target_min, tar
                             or treaty == "current_treaty_defensive_alliance"
                             or treaty == "current_treaty_client_state"
                             or treaty == "current_treaty_client_of_player"
-                            or treaty == "current_treaty_vassal" then
+                            or treaty == "current_treaty_vassal"
+                            or treaty == "current_treaty_vassal_of_player" then
                                 dominated = true
                                 Log("COALITION: " .. candidate_key .. " rejected - allied/overlord of target " .. threat_key .. " (" .. treaty .. ")")
                                 break
@@ -650,7 +708,8 @@ local function BuildCoalitionMembers(threat_key, candidate_pool, target_min, tar
                         for _, treaty in ipairs(treaty_list) do
                             if treaty == "current_treaty_client_state"
                             or treaty == "current_treaty_client_of_player"
-                            or treaty == "current_treaty_vassal" then
+                            or treaty == "current_treaty_vassal"
+                            or treaty == "current_treaty_vassal_of_player" then
                                 dominated = true
                                 Log("COALITION: " .. candidate_key .. " rejected - client/vassal OF target " .. threat_key .. " (" .. treaty .. ")")
                                 break
@@ -738,6 +797,85 @@ local function BuildCoalitionMembers(threat_key, candidate_pool, target_min, tar
     return members
 end
 
+-- Check if the human player qualifies to be invited to a coalition against the threat
+-- Uses the same filters as BuildCoalitionMembers but for a human faction
+local function IsPlayerEligibleForCoalition(threat_key, members)
+    if not COALITION_INCLUDE_HUMAN then return nil end
+
+    local eligible_player = nil
+    for _, hkey in ipairs(human_factions) do
+        local dominated = false
+
+        -- Can't join coalition against yourself
+        if hkey == threat_key then dominated = true end
+        if not dominated and IsInAnyCoalition(hkey) then dominated = true end
+
+        -- Check invite cooldown
+        if not dominated and last_coalition_invite_turn > 0 then
+            local turn = scripting.game_interface:model():turn_number()
+            if (turn - last_coalition_invite_turn) < COALITION_PLAYER_INVITE_COOLDOWN then
+                dominated = true
+                Log("COALITION INVITE: Player " .. hkey .. " rejected — invite cooldown active (" .. (turn - last_coalition_invite_turn) .. "/" .. COALITION_PLAYER_INVITE_COOLDOWN .. " turns)")
+            end
+        end
+
+        -- Check player is not allied/vassal of the threat
+        if not dominated then
+            pcall(function()
+                local hfac = scripting.game_interface:model():world():faction_by_key(hkey)
+                if not hfac or not hfac:has_home_region() then dominated = true; return end
+                local treaties = hfac:treaty_details()
+                if not treaties then return end
+                for other_faction, treaty_list in pairs(treaties) do
+                    local other_key = GetFactionKey(other_faction)
+                    if other_key == threat_key and type(treaty_list) == "table" then
+                        for _, treaty in ipairs(treaty_list) do
+                            if treaty == "current_treaty_military_alliance"
+                            or treaty == "current_treaty_defensive_alliance"
+                            or treaty == "current_treaty_client_state"
+                            or treaty == "current_treaty_client_of_player"
+                            or treaty == "current_treaty_vassal"
+                            or treaty == "current_treaty_vassal_of_player" then
+                                dominated = true
+                                Log("COALITION INVITE: Player " .. hkey .. " rejected — allied/vassal of threat " .. threat_key)
+                                break
+                            end
+                        end
+                    end
+                    if dominated then break end
+                end
+            end)
+        end
+
+        -- Check player is not at war with any coalition member
+        if not dominated then
+            for _, member_key in ipairs(members) do
+                if AreAtWar(hkey, member_key) then
+                    dominated = true
+                    Log("COALITION INVITE: Player " .. hkey .. " rejected — at war with member " .. member_key)
+                    break
+                end
+            end
+        end
+
+        -- Check player is a neighbor or extended neighbor of the threat
+        if not dominated then
+            local neighbors = GetExtendedNeighbors(threat_key)
+            if not neighbors[hkey] then
+                dominated = true
+                Log("COALITION INVITE: Player " .. hkey .. " rejected — not a neighbor of " .. threat_key)
+            end
+        end
+
+        if not dominated then
+            eligible_player = hkey
+            Log("COALITION INVITE: Player " .. hkey .. " is eligible to join coalition vs " .. threat_key)
+            break
+        end
+    end
+    return eligible_player
+end
+
 -- set bitter enemies stance for all coalition members against the threat
 --local function SetBitterEnemies(members, threat_key)
     --for _, member_key in ipairs(members) do
@@ -798,6 +936,50 @@ local function FormCoalition(threat_key, members, turn)
                 cm:force_declare_war(member_key, client_key)
             end)
             Log("COALITION WAR: " .. member_key .. " declares war on " .. client_key .. " (client state of " .. threat_key .. ")")
+        end
+    end
+
+    -- PLAYER DEFENSE: If the target is human, their military/defensive allies join the fight
+    if IsHumanFaction(threat_key) then
+        local player_allies = {}
+        pcall(function()
+            local player_fac = scripting.game_interface:model():world():faction_by_key(threat_key)
+            if not player_fac then return end
+            local treaties = player_fac:treaty_details()
+            if not treaties then return end
+            for other_faction, treaty_list in pairs(treaties) do
+                local other_key = GetFactionKey(other_faction)
+                if other_key and not IsSlaveFaction(other_key) and not IsHumanFaction(other_key) and type(treaty_list) == "table" then
+                    for _, treaty in ipairs(treaty_list) do
+                        if treaty == "current_treaty_military_alliance"
+                        or treaty == "current_treaty_defensive_alliance" then
+                            -- Don't drag in an ally that IS a coalition member
+                            local is_coalition_member = false
+                            for _, mk in ipairs(members) do
+                                if mk == other_key then is_coalition_member = true; break end
+                            end
+                            if not is_coalition_member and IsFactionAlive(other_key) then
+                                player_allies[other_key] = true
+                                Log("COALITION DEFENSE: " .. other_key .. " is allied with player " .. threat_key .. " (" .. treaty .. ")")
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end)
+
+        -- Allies declare war on coalition members (defending the player)
+        for ally_key, _ in pairs(player_allies) do
+            for _, member_key in ipairs(members) do
+                pcall(function()
+                    scripting.game_interface:force_diplomacy(ally_key, member_key, "war", true, true)
+                end)
+                pcall(function()
+                    cm:force_declare_war(ally_key, member_key)
+                end)
+                Log("COALITION DEFENSE: " .. ally_key .. " declares war on " .. member_key .. " (defending player " .. threat_key .. ")")
+            end
         end
     end
 
@@ -899,6 +1081,85 @@ local function DissolveCoalition(coal_index, reason)
         end
     end
 
+    -- PLAYER DEFENSE CLEANUP: If coalition was against the player, make peace for their allies too
+    if IsHumanFaction(coal.threat_key) then
+        local player_allies = {}
+        pcall(function()
+            local player_fac = scripting.game_interface:model():world():faction_by_key(coal.threat_key)
+            if not player_fac then return end
+            local treaties = player_fac:treaty_details()
+            if not treaties then return end
+            for other_faction, treaty_list in pairs(treaties) do
+                local other_key = GetFactionKey(other_faction)
+                if other_key and not IsSlaveFaction(other_key) and not IsHumanFaction(other_key) and type(treaty_list) == "table" then
+                    for _, treaty in ipairs(treaty_list) do
+                        if treaty == "current_treaty_military_alliance"
+                        or treaty == "current_treaty_defensive_alliance" then
+                            player_allies[other_key] = true
+                            break
+                        end
+                    end
+                end
+            end
+        end)
+
+        for ally_key, _ in pairs(player_allies) do
+            for _, member_key in ipairs(coal.members) do
+                if AreAtWar(ally_key, member_key) then
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(ally_key, member_key, "peace", true, true)
+                        scripting.game_interface:force_diplomacy(member_key, ally_key, "peace", true, true)
+                    end)
+                    pcall(function()
+                        cm:force_make_peace(ally_key, member_key)
+                    end)
+                    Log("COALITION DEFENSE PEACE: " .. ally_key .. " <-> " .. member_key .. " (player's ally, coalition dissolved)")
+                end
+            end
+        end
+    end
+
+    -- PLAYER-SPECIFIC CLEANUP: If player was a member, unlock war with former teammates
+    -- and make peace for player's client states
+    for _, member_key in ipairs(coal.members) do
+        if IsHumanFaction(member_key) then
+            -- Re-enable war between player and all other former members
+            for _, other_key in ipairs(coal.members) do
+                if other_key ~= member_key then
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(member_key, other_key, "war", true, true)
+                        scripting.game_interface:force_diplomacy(other_key, member_key, "war", true, true)
+                    end)
+                    Log("COALITION DISSOLVE: War re-enabled between player " .. member_key .. " <-> " .. other_key)
+                end
+            end
+
+            -- Peace for player's client states with the threat
+            local player_clients = GetClientStates(member_key)
+            for _, pclient in ipairs(player_clients) do
+                pcall(function()
+                    scripting.game_interface:force_diplomacy(pclient, coal.threat_key, "peace", true, true)
+                    scripting.game_interface:force_diplomacy(coal.threat_key, pclient, "peace", true, true)
+                end)
+                pcall(function()
+                    cm:force_make_peace(pclient, coal.threat_key)
+                end)
+                -- Also peace with threat's client states
+                for _, tclient in ipairs(threat_clients) do
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(pclient, tclient, "peace", true, true)
+                        scripting.game_interface:force_diplomacy(tclient, pclient, "peace", true, true)
+                    end)
+                    pcall(function()
+                        cm:force_make_peace(pclient, tclient)
+                    end)
+                end
+                Log("COALITION DISSOLVE: Player's client " .. pclient .. " at peace with " .. coal.threat_key)
+            end
+            break  -- only one human player
+        end
+    end
+
     -- ========== UI NOTIFICATION HOOK ==========
     if IsHumanFaction(coal.threat_key) then
         -- Build dissolution popup text with member names
@@ -916,6 +1177,37 @@ local function DissolveCoalition(coal_index, reason)
 
         coalition_notify_members = ""
         Log("COALITION UI: Queued dissolution popup and cleared dynamic text")
+    else
+        -- Check if player was a MEMBER of this coalition
+        local player_was_member = false
+        for _, member_key in ipairs(coal.members) do
+            if IsHumanFaction(member_key) then
+                player_was_member = true
+                break
+            end
+        end
+
+        if player_was_member then
+            local clean_names = {}
+            for _, member_key in ipairs(coal.members) do
+                local name = CleanFactionName(member_key)
+                if IsHumanFaction(member_key) then
+                    name = name .. " (You)"
+                end
+                table.insert(clean_names, name)
+            end
+            local threat_name = CleanFactionName(coal.threat_key)
+
+            coalition_dissolved_text = "The coalition has been dissolved!\n\n"
+                .. "Former Members: " .. table.concat(clean_names, ", ")
+                .. "\nTarget: " .. threat_name
+                .. "\n\nPeace has been achieved. Your armies are free to stand down. "
+                .. "War restrictions with your former allies have been lifted."
+            coalition_dissolved_fired = false
+            coalition_player_dissolved_title_override = true
+            last_coalition_invite_turn = scripting.game_interface:model():turn_number()
+            Log("COALITION UI: Queued player-member dissolution popup, invite cooldown started")
+        end
     end
     Log("*** COALITION DISSOLVED: Coalition against " .. coal.threat_key .. " has been dissolved! (" .. reason .. ") ***")
     -- ==========================================
@@ -995,6 +1287,93 @@ local function EvaluateCoalitions()
     -- always check dissolution and peace locks
     CheckCoalitionDissolution()
     CheckPeaceLocks(turn)
+
+    -- Process deferred coalition invite (player was invited last turn)
+    if pending_coalition_invite and coalition_invite_dilemma_fired then
+        local invite = pending_coalition_invite
+        local members = invite.members
+        local threat_key = invite.threat_key
+        local player_key = invite.player_key
+
+        -- Validate members are still alive
+        local valid_members = {}
+        for _, mk in ipairs(members) do
+            if IsFactionAlive(mk) then
+                table.insert(valid_members, mk)
+            end
+        end
+
+        if #valid_members >= COALITION_MIN_MEMBERS then
+            if coalition_invite_player_choice == true then
+                -- Player accepted — add them to the coalition
+                table.insert(valid_members, player_key)
+                Log("COALITION INVITE: Player " .. player_key .. " JOINED coalition vs " .. threat_key)
+            else
+                Log("COALITION INVITE: Player declined — forming AI-only coalition vs " .. threat_key)
+            end
+            FormCoalition(threat_key, valid_members, turn)
+
+            -- PLAYER-SPECIFIC: Extra protections when player joined the coalition
+            if coalition_invite_player_choice == true then
+                -- 1. Lock war between player and all coalition teammates
+                for _, mk in ipairs(valid_members) do
+                    if mk ~= player_key then
+                        pcall(function()
+                            scripting.game_interface:force_diplomacy(player_key, mk, "war", false, false)
+                            scripting.game_interface:force_diplomacy(mk, player_key, "war", false, false)
+                        end)
+                        Log("COALITION INVITE: War LOCKED between player " .. player_key .. " <-> " .. mk)
+                    end
+                end
+
+                -- 2. Player's client states join the war against the threat
+                local player_clients = GetClientStates(player_key)
+                for _, client_key in ipairs(player_clients) do
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(client_key, threat_key, "war", true, true)
+                    end)
+                    pcall(function()
+                        cm:force_declare_war(client_key, threat_key)
+                    end)
+                    -- Lock peace for client states too
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(client_key, threat_key, "peace", false, false)
+                        scripting.game_interface:force_diplomacy(threat_key, client_key, "peace", false, false)
+                    end)
+                    Log("COALITION INVITE: Player's client " .. client_key .. " joins war vs " .. threat_key)
+                end
+
+                -- 3. Player's client states also get war-locked with threat's client states
+                local threat_clients = GetClientStates(threat_key)
+                for _, pclient in ipairs(player_clients) do
+                    for _, tclient in ipairs(threat_clients) do
+                        pcall(function()
+                            scripting.game_interface:force_diplomacy(pclient, tclient, "war", true, true)
+                        end)
+                        pcall(function()
+                            cm:force_declare_war(pclient, tclient)
+                        end)
+                        Log("COALITION INVITE: Player's client " .. pclient .. " at war with threat's client " .. tclient)
+                    end
+                end
+
+                -- Queue "you joined!" notification for next player turn
+                coalition_player_joined_notify = {
+                    threat_key = threat_key,
+                    members = valid_members
+                }
+            end
+        else
+            Log("COALITION INVITE: Not enough valid members remaining — coalition cancelled vs " .. threat_key)
+        end
+
+        pending_coalition_invite = nil
+        coalition_invite_player_choice = nil
+        coalition_invite_dilemma_text = ""
+        coalition_invite_dilemma_fired = false
+        last_coalition_invite_turn = turn
+        Log("COALITION INVITE: Player invite cooldown started (" .. COALITION_PLAYER_INVITE_COOLDOWN .. " turns)")
+    end
 
     -- first ever call: just snapshot
     if coalition_snapshot_turn == 0 or not next(coalition_snapshots) then
@@ -1203,7 +1582,26 @@ local function EvaluateCoalitions()
                         table.insert(pending_player_coalitions, {threat_key = threat.key, members = members, turn = turn})
                         Log("COALITION: Queued coalition vs " .. threat.key .. " [" .. table.concat(members, ", ") .. "] for player turn start")
                     else
-                        FormCoalition(threat.key, members, turn)
+                        -- Check if player qualifies to be invited (only for AI threats)
+                        local eligible_player = nil
+                        if not pending_coalition_invite then
+                            eligible_player = IsPlayerEligibleForCoalition(threat.key, members)
+                        end
+
+                        if eligible_player and #members >= 2 then
+                            -- Defer formation — invite player first
+                            pending_coalition_invite = {
+                                threat_key = threat.key,
+                                members = members,
+                                turn = turn,
+                                player_key = eligible_player
+                            }
+                            coalition_invite_player_choice = nil
+                            coalition_invite_dilemma_fired = false
+                            Log("COALITION INVITE: Deferred coalition vs " .. threat.key .. " [" .. table.concat(members, ", ") .. "] — inviting player " .. eligible_player)
+                        else
+                            FormCoalition(threat.key, members, turn)
+                        end
                     end
                     formed_this_cycle = true
                 end
@@ -1272,6 +1670,41 @@ local function SaveCoalitionData(context)
     end
 
     Log("COALITION SAVE: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. fc_count .. " formation counts, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
+
+    -- Save peace offer state
+    scripting.game_interface:save_named_value("_peace_last_dilemma_turn", last_peace_dilemma_turn, context)
+    local pending_count = #pending_player_peace_offers
+    scripting.game_interface:save_named_value("_peace_pending_count", pending_count, context)
+    for i, offer in ipairs(pending_player_peace_offers) do
+        scripting.game_interface:save_named_value("_peace_pending_asker_" .. i, offer.asker_key, context)
+        scripting.game_interface:save_named_value("_peace_pending_player_" .. i, offer.player_key, context)
+        scripting.game_interface:save_named_value("_peace_pending_turn_" .. i, offer.turn, context)
+    end
+    if awaiting_peace_response then
+        scripting.game_interface:save_named_value("_peace_awaiting_asker", awaiting_peace_response.asker_key, context)
+        scripting.game_interface:save_named_value("_peace_awaiting_player", awaiting_peace_response.player_key, context)
+        scripting.game_interface:save_named_value("_peace_awaiting_turn", awaiting_peace_response.turn, context)
+    else
+        scripting.game_interface:save_named_value("_peace_awaiting_asker", "", context)
+    end
+    Log("PEACE OFFER SAVE: " .. pending_count .. " pending, awaiting=" .. tostring(awaiting_peace_response ~= nil))
+
+    -- Save coalition invite state
+    if pending_coalition_invite then
+        scripting.game_interface:save_named_value("_coal_invite_threat", pending_coalition_invite.threat_key, context)
+        scripting.game_interface:save_named_value("_coal_invite_player", pending_coalition_invite.player_key, context)
+        scripting.game_interface:save_named_value("_coal_invite_turn", pending_coalition_invite.turn, context)
+        scripting.game_interface:save_named_value("_coal_invite_fired", coalition_invite_dilemma_fired and 1 or 0, context)
+        local mc = #pending_coalition_invite.members
+        scripting.game_interface:save_named_value("_coal_invite_member_count", mc, context)
+        for i, mk in ipairs(pending_coalition_invite.members) do
+            scripting.game_interface:save_named_value("_coal_invite_member_" .. i, mk, context)
+        end
+        Log("COALITION INVITE SAVE: pending invite vs " .. pending_coalition_invite.threat_key .. " (" .. mc .. " members)")
+    else
+        scripting.game_interface:save_named_value("_coal_invite_threat", "", context)
+    end
+    scripting.game_interface:save_named_value("_coal_invite_cooldown_turn", last_coalition_invite_turn, context)
 end
 
 local function LoadCoalitionData(context)
@@ -1341,6 +1774,58 @@ local function LoadCoalitionData(context)
 
     coalition_war_overrides = {}
     Log("COALITION LOAD: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. fc_count .. " formation counts, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
+
+    -- Load peace offer state
+    last_peace_dilemma_turn = scripting.game_interface:load_named_value("_peace_last_dilemma_turn", 0, context)
+    pending_player_peace_offers = {}
+    local pending_count = scripting.game_interface:load_named_value("_peace_pending_count", 0, context)
+    for i = 1, pending_count do
+        local asker = scripting.game_interface:load_named_value("_peace_pending_asker_" .. i, "", context)
+        local player = scripting.game_interface:load_named_value("_peace_pending_player_" .. i, "", context)
+        local t = scripting.game_interface:load_named_value("_peace_pending_turn_" .. i, 0, context)
+        if asker ~= "" and player ~= "" then
+            table.insert(pending_player_peace_offers, {asker_key = asker, player_key = player, turn = t})
+        end
+    end
+    local awaiting_asker = scripting.game_interface:load_named_value("_peace_awaiting_asker", "", context)
+    if awaiting_asker ~= "" then
+        local awaiting_player = scripting.game_interface:load_named_value("_peace_awaiting_player", "", context)
+        local awaiting_turn = scripting.game_interface:load_named_value("_peace_awaiting_turn", 0, context)
+        awaiting_peace_response = {asker_key = awaiting_asker, player_key = awaiting_player, turn = awaiting_turn}
+    else
+        awaiting_peace_response = nil
+    end
+    Log("PEACE OFFER LOAD: " .. pending_count .. " pending, awaiting=" .. tostring(awaiting_peace_response ~= nil))
+
+    -- Load coalition invite state
+    local invite_threat = scripting.game_interface:load_named_value("_coal_invite_threat", "", context)
+    if invite_threat ~= "" then
+        local invite_player = scripting.game_interface:load_named_value("_coal_invite_player", "", context)
+        local invite_turn = scripting.game_interface:load_named_value("_coal_invite_turn", 0, context)
+        local invite_fired = scripting.game_interface:load_named_value("_coal_invite_fired", 0, context)
+        local invite_mc = scripting.game_interface:load_named_value("_coal_invite_member_count", 0, context)
+        local invite_members = {}
+        for i = 1, invite_mc do
+            local mk = scripting.game_interface:load_named_value("_coal_invite_member_" .. i, "", context)
+            if mk ~= "" then table.insert(invite_members, mk) end
+        end
+        if #invite_members > 0 and invite_player ~= "" then
+            pending_coalition_invite = {
+                threat_key = invite_threat,
+                members = invite_members,
+                turn = invite_turn,
+                player_key = invite_player
+            }
+            coalition_invite_dilemma_fired = (invite_fired == 1)
+            coalition_invite_player_choice = nil
+            Log("COALITION INVITE LOAD: pending invite vs " .. invite_threat .. " (" .. #invite_members .. " members, fired=" .. tostring(coalition_invite_dilemma_fired) .. ")")
+        end
+    else
+        pending_coalition_invite = nil
+        coalition_invite_dilemma_fired = false
+        coalition_invite_player_choice = nil
+    end
+    last_coalition_invite_turn = scripting.game_interface:load_named_value("_coal_invite_cooldown_turn", 0, context)
 end
 
 local function ReapplyCoalitionEffects()
@@ -1380,6 +1865,22 @@ local function ReapplyCoalitionEffects()
                         scripting.game_interface:force_diplomacy(member_a, member_b, "military alliance", true, true)
                     end)
                 end
+            end
+        end
+
+        -- Reapply player-specific war locks with coalition teammates
+        for _, member_key in ipairs(coal.members) do
+            if IsHumanFaction(member_key) then
+                for _, other_key in ipairs(coal.members) do
+                    if other_key ~= member_key then
+                        pcall(function()
+                            scripting.game_interface:force_diplomacy(member_key, other_key, "war", false, false)
+                            scripting.game_interface:force_diplomacy(other_key, member_key, "war", false, false)
+                        end)
+                    end
+                end
+                Log("COALITION: Reapplied war locks for player " .. member_key .. " with coalition teammates")
+                break
             end
         end
     end
@@ -1676,7 +2177,7 @@ local function TryInjectCoalitionText()
             end
 
             local is_player_coalition = string.find(title_text, "AGAINST YOU")
-            local is_ai_coalition = string.find(title_text, "AI COALITION")
+            local is_ai_coalition = string.find(title_text, "AI COALITION") or string.find(title_text, "COALITION JOINED")
             local is_dissolved = string.find(title_text, "DISSOLVED")
 
             if is_player_coalition and coalition_notify_members ~= "" then
@@ -1775,10 +2276,24 @@ local function TryInjectCoalitionText()
                 dy_descr:SetStateText(coalition_ai_notify_text)
                 Log("COALITION UI: Injected AI coalition text")
 
+                -- Override title if player joined this coalition
+                if coalition_player_joined_title_override and tx_title then
+                    tx_title:SetStateText("COALITION JOINED")
+                    coalition_player_joined_title_override = false
+                    Log("COALITION UI: Overrode title to 'COALITION JOINED'")
+                end
+
             elseif is_dissolved and coalition_dissolved_text ~= "" then
                 -- DISSOLUTION: show the pre-built text, then clear it (one-time)
                 dy_descr:SetStateText(coalition_dissolved_text)
                 Log("COALITION UI: Injected dissolution text")
+
+                -- Override title if player was a coalition member
+                if coalition_player_dissolved_title_override and tx_title then
+                    tx_title:SetStateText("YOUR COALITION DISSOLVED")
+                    coalition_player_dissolved_title_override = false
+                    Log("COALITION UI: Overrode title to 'YOUR COALITION DISSOLVED'")
+                end
 
             else
                 if title_text ~= "" then
@@ -1794,7 +2309,103 @@ local function TryInjectCoalitionText()
     end
 end
 
--- Listen for panel open events to catch the message event popup
+-- ============================================================================
+-- PEACE OFFER DILEMMA - UI TEXT INJECTION
+-- Injects dynamic text (faction name etc) into the dilemma popup
+-- Path: event_dilemma > description > dy_descr_text
+-- ============================================================================
+
+local function TryInjectPeaceOfferText()
+    if peace_offer_dilemma_text == "" then return end
+
+    local ok_ui, err_ui = pcall(function()
+        local ui_root = cached_ui_root
+        if not ui_root then
+            Log("PEACE OFFER UI: No cached UI root — cannot inject text")
+            return
+        end
+
+        -- Validate root still works
+        local ok_v, _ = pcall(function() return ui_root:Id() end)
+        if not ok_v then
+            cached_ui_root = nil
+            Log("PEACE OFFER UI: Cached root is stale")
+            return
+        end
+
+        -- Navigate to: event_dilemma > description > dy_descr_text
+        local dy_descr = FindUIComponent(ui_root, "event_dilemma", "description", "dy_descr_text")
+        if dy_descr then
+            dy_descr:SetStateText(peace_offer_dilemma_text)
+            Log("PEACE OFFER UI: Injected dynamic text into dilemma popup")
+        else
+            Log("PEACE OFFER UI: Could not find event_dilemma > description > dy_descr_text")
+        end
+
+        -- Inject bundle title into effect display (like "Martial Ambition" in vanilla dilemmas)
+        local dy_effect = FindUIComponent(ui_root, "event_dilemma", "dilemma1_window", "dilemma1_template", "effect_window1", "effect1", "dy_effect")
+        if dy_effect then
+            dy_effect:SetStateText("Peace Accepted")
+            Log("PEACE OFFER UI: Injected 'Peace Accepted' into dy_effect")
+        else
+            Log("PEACE OFFER UI: Could not find dy_effect in dilemma1 effect_window1")
+        end
+
+        -- Inject bundle title for Refuse side
+        local dy_effect2 = FindUIComponent(ui_root, "event_dilemma", "dilemma2_window", "dilemma2_template", "effect_window1", "effect1", "dy_effect")
+        if dy_effect2 then
+            dy_effect2:SetStateText("War Continues")
+            Log("PEACE OFFER UI: Injected 'War Continues' into dilemma2 dy_effect")
+        else
+            Log("PEACE OFFER UI: Could not find dy_effect in dilemma2 effect_window1")
+        end
+    end)
+    if not ok_ui then
+        Log("PEACE OFFER UI: injection failed: " .. tostring(err_ui))
+    end
+end
+
+-- ============================================================================
+-- COALITION INVITE DILEMMA - UI TEXT INJECTION
+-- Path: event_dilemma > description > dy_descr_text (same as peace offer)
+-- ============================================================================
+
+local function TryInjectCoalitionInviteText()
+    if coalition_invite_dilemma_text == "" then return end
+
+    local ok_ui, err_ui = pcall(function()
+        local ui_root = cached_ui_root
+        if not ui_root then return end
+
+        local ok_v, _ = pcall(function() return ui_root:Id() end)
+        if not ok_v then cached_ui_root = nil; return end
+
+        -- Inject description text
+        local dy_descr = FindUIComponent(ui_root, "event_dilemma", "description", "dy_descr_text")
+        if dy_descr then
+            dy_descr:SetStateText(coalition_invite_dilemma_text)
+            Log("COALITION INVITE UI: Injected dynamic text into dilemma popup")
+        end
+
+        -- Inject "Join Coalition" label on Accept side
+        local dy_effect = FindUIComponent(ui_root, "event_dilemma", "dilemma1_window", "dilemma1_template", "effect_window1", "effect1", "dy_effect")
+        if dy_effect then
+            dy_effect:SetStateText("Join Coalition")
+            Log("COALITION INVITE UI: Injected 'Join Coalition' into dy_effect")
+        end
+
+        -- Inject "Stay Neutral" label on Refuse side
+        local dy_effect2 = FindUIComponent(ui_root, "event_dilemma", "dilemma2_window", "dilemma2_template", "effect_window1", "effect1", "dy_effect")
+        if dy_effect2 then
+            dy_effect2:SetStateText("Stay Neutral")
+            Log("COALITION INVITE UI: Injected 'Stay Neutral' into dy_effect2")
+        end
+    end)
+    if not ok_ui then
+        Log("COALITION INVITE UI: injection failed: " .. tostring(err_ui))
+    end
+end
+
 local panel_listener_registered = false
 
 local function OnFactionTurn(context)
@@ -1804,14 +2415,103 @@ local function OnFactionTurn(context)
     if not panel_listener_registered then
         panel_listener_registered = true
 
-        -- Try to capture root from ANY UI click (ComponentLClickUp)
-        if not cached_ui_root then
-            pcall(function()
-                scripting.AddEventCallBack("ComponentLClickUp", function(click_context)
-                    if cached_ui_root then return end  -- already got it
+        -- Register DilemmaChoiceMadeEvent listener for peace offer detection
+        if not dilemma_listener_registered then
+            dilemma_listener_registered = true
+            local ok_dilemma_evt, err_dilemma_evt = pcall(function()
+                scripting.AddEventCallBack("DilemmaChoiceMadeEvent", function(dilemma_context)
+                    if not awaiting_peace_response then return end
                     pcall(function()
-                        if click_context and click_context.component then
-                            local current = UIComponent(click_context.component)
+                        local dilemma_key = dilemma_context:dilemma()
+                        if dilemma_key == "dei_dilemma_AI_OFFER_PEACE" then
+                            local choice = dilemma_context:choice()
+                            if choice == 0 then
+                                peace_offer_player_choice = true
+                                Log("PEACE OFFER EVENT: Player chose ACCEPT (choice=0)")
+                            else
+                                peace_offer_player_choice = false
+                                Log("PEACE OFFER EVENT: Player chose REFUSE (choice=" .. tostring(choice) .. ")")
+                            end
+                        end
+                    end)
+                end)
+                dilemma_listener_available = true
+                Log("PEACE OFFER: DilemmaChoiceMadeEvent listener registered successfully!")
+            end)
+            if not ok_dilemma_evt then
+                dilemma_listener_available = false
+                Log("PEACE OFFER: DilemmaChoiceMadeEvent NOT available (" .. tostring(err_dilemma_evt) .. ") — using fallback mode")
+            end
+        end
+
+        -- Register ComponentLClickUp for UI root capture AND dilemma click detection
+        pcall(function()
+            scripting.AddEventCallBack("ComponentLClickUp", function(click_context)
+                    pcall(function()
+                        if not click_context or not click_context.component then return end
+                        local current = UIComponent(click_context.component)
+
+                        -- PEACE OFFER: Detect Accept/Refuse click on dilemma buttons
+                        -- ONLY trigger on actual dilemma_button clicks, not the whole window area
+                        -- First check if dilemma_button is in the parent chain, THEN determine which window
+                        if awaiting_peace_response and not peace_offer_player_choice then
+                            local walk = current
+                            local found_button = false
+                            for depth = 1, 10 do
+                                local ok_id, cid = pcall(function() return walk:Id() end)
+                                if ok_id and cid then
+                                    if cid == "dilemma_button" then
+                                        found_button = true
+                                    end
+                                    -- Only register choice if we already passed through dilemma_button
+                                    if found_button then
+                                        if cid == "dilemma1_window" then
+                                            peace_offer_player_choice = true
+                                            Log("PEACE OFFER CLICK: Player clicked ACCEPT (dilemma_button in dilemma1_window)")
+                                            return
+                                        elseif cid == "dilemma2_window" then
+                                            peace_offer_player_choice = false
+                                            Log("PEACE OFFER CLICK: Player clicked REFUSE (dilemma_button in dilemma2_window)")
+                                            return
+                                        end
+                                    end
+                                end
+                                local ok_p, parent = pcall(function() return UIComponent(walk:Parent()) end)
+                                if not ok_p or not parent then break end
+                                walk = parent
+                            end
+                        end
+
+                        -- COALITION INVITE: Detect Accept/Decline click on dilemma buttons
+                        if pending_coalition_invite and coalition_invite_dilemma_fired and coalition_invite_player_choice == nil then
+                            local walk = current
+                            local found_button = false
+                            for depth = 1, 10 do
+                                local ok_id, cid = pcall(function() return walk:Id() end)
+                                if ok_id and cid then
+                                    if cid == "dilemma_button" then
+                                        found_button = true
+                                    end
+                                    if found_button then
+                                        if cid == "dilemma1_window" then
+                                            coalition_invite_player_choice = true
+                                            Log("COALITION INVITE CLICK: Player clicked JOIN (dilemma_button in dilemma1_window)")
+                                            return
+                                        elseif cid == "dilemma2_window" then
+                                            coalition_invite_player_choice = false
+                                            Log("COALITION INVITE CLICK: Player clicked DECLINE (dilemma_button in dilemma2_window)")
+                                            return
+                                        end
+                                    end
+                                end
+                                local ok_p, parent = pcall(function() return UIComponent(walk:Parent()) end)
+                                if not ok_p or not parent then break end
+                                walk = parent
+                            end
+                        end
+
+                        -- ROOT CAPTURE: Walk to topmost parent
+                        if not cached_ui_root then
                             for safety = 1, 20 do
                                 local ok_p, parent = pcall(function() return UIComponent(current:Parent()) end)
                                 if not ok_p or not parent then
@@ -1821,15 +2521,13 @@ local function OnFactionTurn(context)
                                 end
                                 current = parent
                             end
-                            -- If we walked 20 levels, topmost is probably root
                             cached_ui_root = current
                             Log("COALITION UI: Captured root via ComponentLClickUp (max depth)")
                         end
                     end)
                 end)
-                Log("COALITION UI: ComponentLClickUp listener registered for root capture")
+                Log("COALITION UI: ComponentLClickUp listener registered (root capture + dilemma detection)")
             end)
-        end
 
         local ok_panel, _ = pcall(function()
             scripting.AddEventCallBack("PanelOpenedCampaign", function(panel_context)
@@ -1864,6 +2562,18 @@ local function OnFactionTurn(context)
                 if coalition_notify_members ~= "" or coalition_ai_notify_text ~= "" or coalition_dissolved_text ~= "" then
                     Log("COALITION UI: PanelOpenedCampaign fired, re-injecting text")
                     TryInjectCoalitionText()
+                end
+
+                -- Inject peace offer dilemma text if active
+                if peace_offer_dilemma_text ~= "" then
+                    Log("PEACE OFFER UI: PanelOpenedCampaign fired, injecting dilemma text")
+                    TryInjectPeaceOfferText()
+                end
+
+                -- Inject coalition invite dilemma text if active
+                if coalition_invite_dilemma_text ~= "" then
+                    Log("COALITION INVITE UI: PanelOpenedCampaign fired, injecting dilemma text")
+                    TryInjectCoalitionInviteText()
                 end
             end)
             Log("COALITION UI: PanelOpenedCampaign listener registered")
@@ -1935,6 +2645,60 @@ local function OnFactionTurn(context)
         end
     end
 
+    -- On player turn: fire "YOU JOINED A COALITION" notification
+    if fac:is_human() and coalition_player_joined_notify then
+        local notify = coalition_player_joined_notify
+        local current_turn = scripting.game_interface:model():turn_number()
+        local clean_names = {}
+        for _, mk in ipairs(notify.members) do
+            local name = CleanFactionName(mk)
+            if IsHumanFaction(mk) then
+                name = name .. " (You)"
+            end
+            table.insert(clean_names, name)
+        end
+        local threat_name = CleanFactionName(notify.threat_key)
+
+        -- Find peace lock turns for this coalition
+        local peace_turns = 0
+        for _, coal in ipairs(active_coalitions) do
+            if coal.threat_key == notify.threat_key then
+                if coal.peace_lock_until > 0 and current_turn < coal.peace_lock_until then
+                    peace_turns = coal.peace_lock_until - current_turn
+                end
+                break
+            end
+        end
+
+        coalition_ai_notify_text = "You have joined a coalition!\n\n"
+            .. "Coalition Members:\n" .. table.concat(clean_names, ", ")
+            .. "\n\nTarget: " .. threat_name
+        if peace_turns > 0 then
+            coalition_ai_notify_text = coalition_ai_notify_text
+                .. "\n\nPeace LOCKED for " .. peace_turns .. " turn" .. (peace_turns > 1 and "s" or "") .. "!"
+        end
+        coalition_ai_notify_text = coalition_ai_notify_text
+            .. "\n\nYour armies now march alongside your allies! "
+            .. "Crush this common enemy together!"
+
+        -- Flag to override title in TryInjectCoalitionText
+        coalition_player_joined_title_override = true
+
+        -- Remove matching entry from AI notify queue so it doesn't double-fire
+        local new_queue = {}
+        for _, entry in ipairs(coalition_ai_notify_queue) do
+            if entry.threat ~= notify.threat_key then
+                table.insert(new_queue, entry)
+            end
+        end
+        coalition_ai_notify_queue = new_queue
+
+        coalition_player_joined_notify = nil
+        scripting.game_interface:show_message_event("custom_event_951", 0, 0)
+        coalition_ui_pending = true
+        Log("COALITION: Fired custom_event_951 for PLAYER JOINED coalition vs " .. notify.threat_key)
+    end
+
     -- On player turn: fire AI coalition notification if any formed (one-time, not recurring)
     if fac:is_human() and #coalition_ai_notify_queue > 0 then
         -- Build combined text for all AI coalitions that formed this cycle
@@ -1974,6 +2738,161 @@ local function OnFactionTurn(context)
         Log("COALITION UI: Fallback - trying injection on player turn start")
         TryInjectCoalitionText()
         -- Don't clear coalition_notify_members here - needed for re-opening the notification
+    end
+
+    -- ========================================================================
+    -- PEACE OFFER DILEMMA SYSTEM (player turn only)
+    -- Step 1: Check if player responded to a previous peace offer
+    -- Step 2: Fire next pending offer if available
+    -- ========================================================================
+    if fac:is_human() then
+        local player_key = fac:name()
+        local current_turn = scripting.game_interface:model():turn_number()
+
+        -- Step 1: Check response to previous peace offer dilemma
+        if awaiting_peace_response then
+            local asker = awaiting_peace_response.asker_key
+            local target = awaiting_peace_response.player_key
+
+            if peace_offer_player_choice == true then
+                -- Player clicked ACCEPT
+                Log("PEACE OFFER: Player ACCEPTED peace with " .. asker)
+                if IsFactionAlive(asker) and AreAtWar(asker, target) then
+                    -- Check coalition peace block first
+                    local coal_blocked = false
+                    for _, coal in ipairs(active_coalitions) do
+                        local is_member = false
+                        for _, mk in ipairs(coal.members) do
+                            if mk == asker then is_member = true; break end
+                        end
+                        if is_member and coal.threat_key == target and coal.peace_lock_until > 0 and current_turn < coal.peace_lock_until then
+                            coal_blocked = true
+                            break
+                        end
+                    end
+
+                    if not coal_blocked then
+                        pcall(function() cm:force_make_peace(asker, target) end)
+                        Log("PEACE OFFER: *** PEACE FORCED *** " .. asker .. " <-> " .. target)
+                    else
+                        Log("PEACE OFFER: Accepted but coalition peace lock blocks " .. asker)
+                    end
+                else
+                    Log("PEACE OFFER: " .. asker .. " is dead or no longer at war — skipping")
+                end
+            elseif peace_offer_player_choice == false then
+                -- Player clicked REFUSE
+                Log("PEACE OFFER: Player REFUSED peace with " .. asker .. " — war continues")
+            else
+                -- Choice still nil — player may have closed the dilemma without clicking
+                -- Force peace as safety fallback (same as old behavior)
+                if IsFactionAlive(asker) and AreAtWar(asker, target) then
+                    pcall(function() cm:force_make_peace(asker, target) end)
+                    Log("PEACE OFFER: No click detected — forcing peace with " .. asker .. " as fallback")
+                end
+            end
+
+            -- Clean up
+            pcall(function() scripting.game_interface:remove_effect_bundle("dei_peace_offer_accepted", target) end)
+            awaiting_peace_response = nil
+            peace_offer_player_choice = nil
+            peace_offer_dilemma_text = ""
+        end
+
+        -- Step 2: Fire next pending peace offer dilemma (one per turn, with cooldown)
+        if #pending_player_peace_offers > 0 and not awaiting_peace_response then
+            if (current_turn - last_peace_dilemma_turn) >= PLAYER_PEACE_DILEMMA_COOLDOWN then
+                -- Find first valid offer (asker still alive and at war)
+                local offer = nil
+                while #pending_player_peace_offers > 0 do
+                    local candidate = table.remove(pending_player_peace_offers, 1)
+                    if IsFactionAlive(candidate.asker_key) and AreAtWar(candidate.asker_key, candidate.player_key) then
+                        offer = candidate
+                        break
+                    else
+                        Log("PEACE OFFER: Discarded stale offer from " .. candidate.asker_key .. " (dead or not at war)")
+                    end
+                end
+
+                if offer then
+                    awaiting_peace_response = offer
+                    last_peace_dilemma_turn = current_turn
+
+                    -- Build dynamic text for the dilemma popup
+                    local asker_name = CleanFactionName(offer.asker_key)
+                    peace_offer_dilemma_text = asker_name .. " has sent envoys seeking to end hostilities.\n\n"
+                        .. "Their emissaries arrive bearing gifts and promises of peace. "
+                        .. "Will you accept their offer and lay down your arms, or continue the war?\n\n"
+                        .. "Note: Peace will take effect at the start of your next turn."
+
+                    local ok_dilemma, err_dilemma = pcall(function()
+                        scripting.game_interface:trigger_custom_dilemma(
+                            offer.player_key,
+                            "dei_dilemma_AI_OFFER_PEACE",
+                            "payload { effect_bundle { bundle_key dei_peace_offer_accepted; turns 10; } }",
+                            "payload { effect_bundle { bundle_key dei_peace_offer_refused; turns 10; } }",
+                            true
+                        )
+                    end)
+                    if ok_dilemma then
+                        Log("PEACE OFFER: Fired dei_dilemma_AI_OFFER_PEACE — " .. offer.asker_key .. " offers peace to " .. offer.player_key)
+                    else
+                        Log("PEACE OFFER ERROR: trigger_custom_dilemma failed: " .. tostring(err_dilemma))
+                        awaiting_peace_response = nil
+                        peace_offer_dilemma_text = ""
+                    end
+                end
+            else
+                Log("PEACE OFFER: Cooldown active (" .. (current_turn - last_peace_dilemma_turn) .. "/" .. PLAYER_PEACE_DILEMMA_COOLDOWN .. " turns)")
+            end
+        end
+    end
+
+    -- ========================================================================
+    -- COALITION INVITE DILEMMA SYSTEM (player turn only)
+    -- Fire invite dilemma if a coalition was deferred for player invitation
+    -- ========================================================================
+    if fac:is_human() and pending_coalition_invite and not coalition_invite_dilemma_fired then
+        local invite = pending_coalition_invite
+        local player_key = invite.player_key
+
+        -- Build member names for display
+        local clean_names = {}
+        for _, mk in ipairs(invite.members) do
+            table.insert(clean_names, CleanFactionName(mk))
+        end
+        local member_list = table.concat(clean_names, ", ")
+        local threat_name = CleanFactionName(invite.threat_key)
+
+        coalition_invite_dilemma_text = member_list .. " seek your aid in a coalition against " .. threat_name .. ".\n\n"
+            .. "Their armies are gathering and they request your military support. "
+            .. "Will you join their war, or remain neutral?\n\n"
+            .. "Note: If you join, you will be at war with " .. threat_name .. " and peace will be locked."
+
+        coalition_invite_dilemma_fired = true
+
+        local ok_dilemma, err_dilemma = pcall(function()
+            scripting.game_interface:trigger_custom_dilemma(
+                player_key,
+                "dei_dilemma_COALITION_INVITE",
+                "payload { effect_bundle { bundle_key dei_coalition_invite_joined; turns 10; } }",
+                "payload { effect_bundle { bundle_key dei_coalition_invite_declined; turns 5; } }",
+                true
+            )
+        end)
+        if ok_dilemma then
+            Log("COALITION INVITE: Fired dei_dilemma_COALITION_INVITE — " .. member_list .. " invite " .. player_key .. " vs " .. invite.threat_key)
+        else
+            Log("COALITION INVITE ERROR: trigger_custom_dilemma failed: " .. tostring(err_dilemma))
+            -- Form coalition without player
+            if #invite.members >= COALITION_MIN_MEMBERS then
+                FormCoalition(invite.threat_key, invite.members, invite.turn)
+            end
+            pending_coalition_invite = nil
+            coalition_invite_player_choice = nil
+            coalition_invite_dilemma_text = ""
+            coalition_invite_dilemma_fired = false
+        end
     end
 
     if fac:is_human() then return end
@@ -2025,6 +2944,19 @@ local function OnNewCampaign(context)
     active_coalitions = {}
     coalition_reapplied_after_load = true
     coalition_checked_this_turn = false
+    pending_player_peace_offers = {}
+    awaiting_peace_response = nil
+    last_peace_dilemma_turn = 0
+    peace_offer_dilemma_text = ""
+    peace_offer_player_choice = nil
+    pending_coalition_invite = nil
+    coalition_invite_player_choice = nil
+    coalition_invite_dilemma_text = ""
+    coalition_invite_dilemma_fired = false
+    coalition_player_joined_notify = nil
+    coalition_player_joined_title_override = false
+    coalition_player_dissolved_title_override = false
+    last_coalition_invite_turn = 0
     GetHumans()
     Log("campaign started - threshold: " .. WAR_DISTANCE_THRESHOLD
         .. " | coalition: " .. tostring(COALITION_ENABLED)
@@ -2046,32 +2978,64 @@ Log("smart diplomacy loading...")
 -- Returns true if peace between these two factions would violate an active coalition
 -- ============================================================================
 function IsCoalitionPeaceBlocked(faction_key_a, faction_key_b)
+    local current_turn = 0
+    pcall(function() current_turn = scripting.game_interface:model():turn_number() end)
+
     for _, coal in ipairs(active_coalitions) do
-        local threat = coal.threat_key
-        local threat_clients = GetClientStates(threat)
+        -- If peace lock has expired, allow peace so AI can naturally dissolve the coalition
+        if coal.peace_lock_until == 0 or current_turn >= coal.peace_lock_until then
+            -- Peace lock expired — don't block, let the AI peace system do its job
+        else
+            local threat = coal.threat_key
+            local threat_clients = GetClientStates(threat)
 
-        -- Build a set of all "threat side" factions (target + their clients)
-        local threat_side = {[threat] = true}
-        for _, ck in ipairs(threat_clients) do
-            threat_side[ck] = true
-        end
+            -- Build a set of all "threat side" factions (target + their clients)
+            local threat_side = {[threat] = true}
+            for _, ck in ipairs(threat_clients) do
+                threat_side[ck] = true
+            end
 
-        -- Build a set of all coalition members
-        local member_side = {}
-        for _, mk in ipairs(coal.members) do
-            member_side[mk] = true
-        end
+            -- Build a set of all coalition members
+            local member_side = {}
+            for _, mk in ipairs(coal.members) do
+                member_side[mk] = true
+            end
 
-        -- Check if one faction is on the member side and the other on the threat side
-        if (member_side[faction_key_a] and threat_side[faction_key_b])
-        or (member_side[faction_key_b] and threat_side[faction_key_a]) then
-            Log("COALITION LOCK: Peace blocked between " .. faction_key_a .. " and " .. faction_key_b .. " (active coalition vs " .. threat .. ")")
-            return true
+            -- Check if one faction is on the member side and the other on the threat side
+            if (member_side[faction_key_a] and threat_side[faction_key_b])
+            or (member_side[faction_key_b] and threat_side[faction_key_a]) then
+                Log("COALITION LOCK: Peace blocked between " .. faction_key_a .. " and " .. faction_key_b .. " (active coalition vs " .. threat .. ", lock until turn " .. coal.peace_lock_until .. ")")
+                return true
+            end
         end
     end
     return false
 end
 
+-- ============================================================================
+-- GLOBAL API: Called by population.lua when AI wants to offer peace to player
+-- Instead of force_make_peace, queues a dilemma popup for the player to accept/refuse
+-- ============================================================================
+function RequestPeaceWithPlayer(asker_key, player_key)
+    -- Don't queue duplicates
+    for _, offer in ipairs(pending_player_peace_offers) do
+        if offer.asker_key == asker_key then
+            Log("PEACE OFFER: " .. asker_key .. " already has pending offer to " .. player_key .. " — skipping duplicate")
+            return
+        end
+    end
+    -- Don't queue if we're already awaiting a response
+    if awaiting_peace_response and awaiting_peace_response.asker_key == asker_key then
+        Log("PEACE OFFER: " .. asker_key .. " already awaiting response — skipping")
+        return
+    end
+    table.insert(pending_player_peace_offers, {
+        asker_key = asker_key,
+        player_key = player_key,
+        turn = scripting.game_interface:model():turn_number()
+    })
+    Log("PEACE OFFER: " .. asker_key .. " requests peace with player " .. player_key .. " (queued for dilemma)")
+end
 scripting.AddEventCallBack("WorldCreated", OnNewCampaign)
 scripting.AddEventCallBack("LoadingGame", OnLoad)
 scripting.AddEventCallBack("SavingGame", OnSave)

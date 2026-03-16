@@ -1913,3 +1913,7 @@ custom_event_952		rom_Hellenistic		custom_event_952	rom_politics.png	rom_event_m
 custom_event_952		rom_Roman		custom_event_952	rom_politics.png	rom_event_message.png	campaign_ui_message_negative
 custom_event_952		rom_Eastern		custom_event_952	rom_politics.png	rom_event_message.png	campaign_ui_message_negative
 custom_event_952		rom_Barbarian		custom_event_952	rom_politics.png	rom_event_message.png	campaign_ui_message_negative
+custom_event_953		rom_Barbarian		custom_event_953	rom_politics.png	rom_event_message.png	campaign_ui_message_negative
+custom_event_953		rom_Eastern		custom_event_953	rom_politics.png	rom_event_message.png	campaign_ui_message_negative
+custom_event_953		rom_Roman		custom_event_953	rom_politics.png	rom_event_message.png	campaign_ui_message_negative
+custom_event_953		rom_Hellenistic		custom_event_953	rom_politics.png	rom_event_message.png	campaign_ui_message_negative

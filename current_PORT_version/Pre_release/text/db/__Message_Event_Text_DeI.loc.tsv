@@ -129,3 +129,4 @@ message_event_text_text_welcome_to_invasion_rome	Instead of changing government 
 message_event_text_text_custom_event_950	Your impressive growth has sparked concern amongst other factions, and they mean to stop you! A coalition of enemies have formed against you. Open your diplomacy screen to see who foolishly took up arms! Hint: Achieving peace with HALF of the coalition will DISBAND IT!	true
 message_event_text_text_custom_event_951	Rival nations have banded together in pursuit of a common enemy! They aim to change the balance of powwer in the region..	true
 message_event_text_text_custom_event_952	You have beaten back the forces that combined to keep you at bay!	true
+message_event_text_text_custom_event_953	Your coalition status has changed.	true
