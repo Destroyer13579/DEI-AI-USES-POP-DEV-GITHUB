@@ -197,6 +197,14 @@ local function IsInAnyCoalition(faction_key)
     return false
 end
 
+-- check if a faction is the TARGET of any active coalition (not a member)
+local function IsCoalitionTarget(faction_key)
+    for _, coal in ipairs(active_coalitions) do
+        if coal.threat_key == faction_key then return true end
+    end
+    return false
+end
+
 -- count how many active coalitions target a human player
 local function CountPlayerCoalitions()
     local count = 0
@@ -1441,18 +1449,21 @@ local function EvaluateCoalitions()
     local threats = {}
 
     for fkey, wd in pairs(world_data) do
-        local dominated = false
-
-        if not COALITION_INCLUDE_HUMAN and wd.is_human then dominated = true end
-        if not dominated and IsInAnyCoalition(fkey) then dominated = true end
-        if not dominated and wd.size < COALITION_MIN_REGIONS then dominated = true end
+        -- skip checks: coalition target, cooldown, or human excluded
+        -- Coalition MEMBERS still accumulate threat (they may be expanding during the war)
+        -- but are blocked from triggering formation while active in a coalition
+        local skip_accumulation = false
+        local skip_formation = false
+        if not COALITION_INCLUDE_HUMAN and wd.is_human then skip_accumulation = true end
+        if not skip_accumulation and IsCoalitionTarget(fkey) then skip_accumulation = true end
+        if not skip_accumulation and IsInAnyCoalition(fkey) then skip_formation = true end
 
         local cd = coalition_cooldowns[fkey] or 0
-        if not dominated and cd > 0 and (turn - cd) < COALITION_COOLDOWN then
-            dominated = true
+        if not skip_accumulation and cd > 0 and (turn - cd) < COALITION_COOLDOWN then
+            skip_accumulation = true
         end
 
-        if not dominated then
+        if not skip_accumulation then
             local growth_component = 0
             local size_component = 0
 
@@ -1486,34 +1497,39 @@ local function EvaluateCoalitions()
                     .. " growth=+" .. wd.growth .. " (avg " .. string.format("%.2f", avg_growth) .. ")"
                     .. " | g=" .. string.format("%.1f", growth_component)
                     .. " s=" .. string.format("%.1f", size_component)
-                    .. " | " .. math.floor(old_score) .. " -> " .. math.floor(new_score))
+                    .. " | " .. math.floor(old_score) .. " -> " .. math.floor(new_score)
+                    .. (skip_formation and " [in coalition, formation blocked]" or ""))
 
-                if new_score >= THREAT_SEVERE_THRESHOLD then
-                    local size_roll = math.random()
-                    local t_min, t_max
-                    if new_score >= THREAT_SEVERE_THRESHOLD * 1.5 then
-                        t_min = 3
-                        t_max = (size_roll < 0.4) and 4 or 5
-                    elseif new_score >= THREAT_SEVERE_THRESHOLD * 1.2 then
-                        t_min = 3
-                        t_max = (size_roll < 0.7) and 4 or 5
-                    else
-                        t_min = 2
-                        t_max = (size_roll < 0.5) and 3 or 4
+                -- Only eligible for coalition formation if they meet MIN_REGIONS
+                -- and are not currently a member of an active coalition
+                if not skip_formation and wd.size >= COALITION_MIN_REGIONS then
+                    if new_score >= THREAT_SEVERE_THRESHOLD then
+                        local size_roll = math.random()
+                        local t_min, t_max
+                        if new_score >= THREAT_SEVERE_THRESHOLD * 1.5 then
+                            t_min = 3
+                            t_max = (size_roll < 0.4) and 4 or 5
+                        elseif new_score >= THREAT_SEVERE_THRESHOLD * 1.2 then
+                            t_min = 3
+                            t_max = (size_roll < 0.7) and 4 or 5
+                        else
+                            t_min = 2
+                            t_max = (size_roll < 0.5) and 3 or 4
+                        end
+                        table.insert(threats, {key = fkey, growth = new_score, level = 2, is_human = wd.is_human, target_min = t_min, target_max = t_max})
+                        Log("COALITION: " .. fkey .. " SEVERE (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
+                    elseif new_score >= THREAT_MILD_THRESHOLD then
+                        local size_roll = math.random()
+                        local t_min = 2
+                        local t_max
+                        if new_score >= THREAT_MILD_THRESHOLD * 1.4 then
+                            t_max = (size_roll < 0.6) and 3 or 4
+                        else
+                            t_max = (size_roll < 0.8) and 2 or 3
+                        end
+                        table.insert(threats, {key = fkey, growth = new_score, level = 1, is_human = wd.is_human, target_min = t_min, target_max = t_max})
+                        Log("COALITION: " .. fkey .. " MILD (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
                     end
-                    table.insert(threats, {key = fkey, growth = new_score, level = 2, is_human = wd.is_human, target_min = t_min, target_max = t_max})
-                    Log("COALITION: " .. fkey .. " SEVERE (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
-                elseif new_score >= THREAT_MILD_THRESHOLD then
-                    local size_roll = math.random()
-                    local t_min = 2
-                    local t_max
-                    if new_score >= THREAT_MILD_THRESHOLD * 1.4 then
-                        t_max = (size_roll < 0.6) and 3 or 4
-                    else
-                        t_max = (size_roll < 0.8) and 2 or 3
-                    end
-                    table.insert(threats, {key = fkey, growth = new_score, level = 1, is_human = wd.is_human, target_min = t_min, target_max = t_max})
-                    Log("COALITION: " .. fkey .. " MILD (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
                 end
             end
         end
@@ -1940,8 +1956,9 @@ local function BlockWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
             scripting.game_interface:force_diplomacy(ai_key, hkey, "war", false, false)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", false, false)
         end)
-        Log("BLOCKED: " .. ai_key .. " -> " .. hkey)
+        Log("BLOCKED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
     end
     blocked_factions[ai_key] = true
 end
@@ -1950,8 +1967,9 @@ local function EnableWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
             scripting.game_interface:force_diplomacy(ai_key, hkey, "war", true, true)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", true, true)
         end)
-        Log("ENABLED: " .. ai_key .. " -> " .. hkey)
+        Log("ENABLED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
     end
     blocked_factions[ai_key] = false
 end
