@@ -32,8 +32,9 @@ _G.main_env = getfenv(1)
 -- LIBRARIES REQUIRED  ---------------------------------------------------------------------
 -- #####-------------------------
 
--- require "lua_scripts.ai_campaign_behavior" - AI Uses Population testing script for next major update
+require "lua_scripts.smart_economy"
 require "lua_scripts.smart_diplomacy"
+-- require "lua_scripts.ai_personality_manager"
 local scripting = require "lua_scripts.EpisodicScripting"
 local modifier_lib = require "script._lib.manpower.population_modifiers"
 local list_lib = require "script._lib.manpower.population_tables"
@@ -961,6 +962,8 @@ function SetRegionTable()
 	region_name_table = RegionKeytoRegionLoc
 	
   end;
+  
+  _G._pop_region_table = region_table
   
   -- PopLog("Region Table Set: " .. campaignName[].., "SetRegionTable()")
 
@@ -11774,5 +11777,29 @@ function calc_level(total_faction_population)
   end;
 end;
 
+-- Expose region_table for faction_rankings to read population data
+_G._pop_region_table = nil
+
+-- Bridge function for faction_rankings to get total population for any faction
+function _G.GetFactionTotalPopulation(faction)
+    local rt = _G._pop_region_table
+    if not rt then return 0 end
+    local total = 0
+    local ok, err = pcall(function()
+        for i = 0, faction:region_list():num_items() - 1 do
+            local regionName = faction:region_list():item_at(i):name()
+            if rt[regionName] then
+                total = total + (rt[regionName][1] or 0)
+                              + (rt[regionName][2] or 0)
+                              + (rt[regionName][3] or 0)
+                              + (rt[regionName][4] or 0)
+            end
+        end
+    end)
+    return math.floor(total)
+end
+
+-- Load faction rankings last so errors here don't affect population
+require "lua_scripts.faction_rankings"
 --scripting.AddEventCallBack("FactionTurnStart", FactionArmyIncrease);
 -- #####---------------------------------- END #####

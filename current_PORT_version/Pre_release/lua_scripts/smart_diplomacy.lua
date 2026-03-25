@@ -28,7 +28,7 @@ local COALITION_CHECK_DELTA = 1
 local COALITION_GROWTH_MILD = 0.35
 local COALITION_GROWTH_SEVERE = 0.65
 -- threat meter
-local THREAT_DECAY = 0.15
+local THREAT_DECAY = 0.10
 local THREAT_GROWTH_WEIGHT = 15
 local THREAT_SIZE_WEIGHT = 10
 local THREAT_MILD_THRESHOLD = 50
@@ -36,6 +36,7 @@ local THREAT_SEVERE_THRESHOLD = 80
 local THREAT_POST_TRIGGER = 0.4
 local THREAT_GROWTH_RATIO_CAP = 5.0
 local THREAT_SIZE_RATIO_CAP = 5.0
+local THREAT_GROWTH_WINDOW = 3   -- measure growth over this many turns before resetting baseline
 local COALITION_MIN_TURN = 10
 local COALITION_MIN_REGIONS = 7
 local COALITION_COOLDOWN = 10
@@ -77,6 +78,7 @@ local coalition_new_formation = false  -- true when coalition JUST formed (wars 
 
 -- peace offer dilemma system (AI offers peace to player via popup)
 local pending_player_peace_offers = {}   -- queued offers: [{asker_key, player_key, turn}]
+local cascade_wars_previous = {}         -- faction_key -> {enemy_key = true} snapshot from last turn (for cascade detection)
 local awaiting_peace_response = nil       -- active dilemma waiting for response: {asker_key, player_key, turn}
 local PLAYER_PEACE_DILEMMA_COOLDOWN = 5   -- min turns between peace offer popups
 local last_peace_dilemma_turn = 0
@@ -95,6 +97,18 @@ local coalition_player_joined_title_override = false  -- when true, TryInjectCoa
 local coalition_player_dissolved_title_override = false  -- when true, dissolution popup says "YOUR COALITION DISSOLVED"
 local COALITION_PLAYER_INVITE_COOLDOWN = 10  -- min turns between coalition invites to the player
 local last_coalition_invite_turn = 0         -- turn when player last left or was invited to a coalition
+
+-- ============================================================================
+-- BRIDGE FUNCTIONS (global, for faction_rankings.lua to read coalition state)
+-- ============================================================================
+
+function GetActiveCoalitions()
+    return active_coalitions
+end
+
+function GetFactionThreatScores()
+    return faction_threat_scores
+end
 
 -- ============================================================================
 -- LOGGING
@@ -305,9 +319,10 @@ local function CheckCascadePeace(ai_faction)
     local ai_key = ai_faction:name()
 
     -- =====================================================================
-    -- PASS 1: This faction is an OVERLORD — cascade peace DOWN to all clients/vassals
-    -- If this faction is at peace with enemy X, but a client is still at war with X, force peace.
-    -- Works for both human and AI clients.
+    -- PASS 1: This faction is an OVERLORD — cascade peace DOWN to clients
+    -- ONLY cascade when the overlord RECENTLY ENDED a war with enemy X
+    -- (was at war last turn, not at war this turn). Never cascade if the
+    -- overlord was NEVER at war with that enemy.
     -- =====================================================================
     local clients = {}
     pcall(function()
@@ -322,7 +337,6 @@ local function CheckCascadePeace(ai_faction)
                     or treaty == "current_treaty_client_of_player"
                     or treaty == "current_treaty_vassal"
                     or treaty == "current_treaty_vassal_of_player" then
-                        -- Only count as client if they have fewer regions and are not human
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
                         if other_fac and not IsHumanFaction(other_key) and other_fac:region_list():num_items() < my_regions then
                             clients[other_key] = true
@@ -342,55 +356,70 @@ local function CheckCascadePeace(ai_faction)
     end)
 
     if next(clients) then
-        local overlord_wars = GetWarsForFaction(ai_key)
-        for client_key, _ in pairs(clients) do
-            -- Never cascade peace on behalf of a human client — they control their own diplomacy
-            if IsHumanFaction(client_key) then
-                Log("CASCADE PEACE: Skipping human client " .. client_key .. " (player controls own diplomacy)")
-            else
-                local client_wars = GetWarsForFaction(client_key)
-                for enemy_key, _ in pairs(client_wars) do
-                    if not overlord_wars[enemy_key] and enemy_key ~= ai_key then
-                        -- Never force peace ON the human player — don't end their wars without consent
-                        if IsHumanFaction(enemy_key) then
-                            Log("CASCADE PEACE: Skipping " .. client_key .. " <-> " .. enemy_key .. " (will not force peace on human player)")
-                        else
-                            -- Block cascade if enemy is a coalition member targeting this client
-                            local is_coalition_member = false
-                            for _, coal in ipairs(active_coalitions) do
-                                if coal.threat_key == client_key then
-                                    for _, member_key in ipairs(coal.members) do
-                                        if member_key == enemy_key then
-                                            is_coalition_member = true
-                                            break
+        local overlord_wars_current = GetWarsForFaction(ai_key)
+        local overlord_wars_previous = cascade_wars_previous[ai_key] or {}
+
+        -- Find wars the overlord ENDED this turn (was at war before, not now)
+        local ended_wars = {}
+        for enemy_key, _ in pairs(overlord_wars_previous) do
+            if not overlord_wars_current[enemy_key] then
+                ended_wars[enemy_key] = true
+            end
+        end
+
+        -- Update snapshot for next turn
+        cascade_wars_previous[ai_key] = overlord_wars_current
+
+        -- Only cascade for ENDED wars, not "was never at war"
+        if next(ended_wars) then
+            for client_key, _ in pairs(clients) do
+                if IsHumanFaction(client_key) then
+                    Log("CASCADE PEACE: Skipping human client " .. client_key .. " (player controls own diplomacy)")
+                else
+                    local client_wars = GetWarsForFaction(client_key)
+                    for enemy_key, _ in pairs(client_wars) do
+                        if ended_wars[enemy_key] and enemy_key ~= ai_key then
+                            if IsHumanFaction(enemy_key) then
+                                Log("CASCADE PEACE: Skipping " .. client_key .. " <-> " .. enemy_key .. " (will not force peace on human player)")
+                            else
+                                -- Block cascade if enemy is a coalition member targeting this client
+                                local is_coalition_member = false
+                                for _, coal in ipairs(active_coalitions) do
+                                    if coal.threat_key == client_key then
+                                        for _, member_key in ipairs(coal.members) do
+                                            if member_key == enemy_key then
+                                                is_coalition_member = true
+                                                break
+                                            end
                                         end
                                     end
+                                    if is_coalition_member then break end
                                 end
-                                if is_coalition_member then break end
-                            end
 
-                            if not is_coalition_member then
-                                pcall(function()
-                                    cm:force_make_peace(client_key, enemy_key)
-                                end)
-                                Log("CASCADE PEACE: " .. client_key .. " <-> " .. enemy_key
-                                    .. " (overlord " .. ai_key .. " at peace)")
-                            else
-                                Log("CASCADE PEACE: BLOCKED " .. client_key .. " <-> " .. enemy_key
-                                    .. " (active coalition member vs " .. client_key .. ")")
+                                if not is_coalition_member then
+                                    pcall(function()
+                                        cm:force_make_peace(client_key, enemy_key)
+                                    end)
+                                    Log("CASCADE PEACE: " .. client_key .. " <-> " .. enemy_key
+                                        .. " (overlord " .. ai_key .. " ended war this turn)")
+                                else
+                                    Log("CASCADE PEACE: BLOCKED " .. client_key .. " <-> " .. enemy_key
+                                        .. " (active coalition member vs " .. client_key .. ")")
+                                end
                             end
                         end
                     end
                 end
             end
         end
+    else
+        -- Not an overlord — still snapshot wars for future comparison
+        cascade_wars_previous[ai_key] = GetWarsForFaction(ai_key)
     end
 
     -- =====================================================================
     -- PASS 2: This faction is a CLIENT — find overlord and inherit their peace
-    -- If the overlord (human or AI) is at peace with enemy X, but this faction
-    -- is still at war with X, force peace. Covers human overlord -> AI client.
-    -- Uses region count: overlord always has more regions than client.
+    -- Same fix: only cascade if overlord ENDED a war this turn
     -- =====================================================================
     local overlord_key = nil
     pcall(function()
@@ -405,7 +434,6 @@ local function CheckCascadePeace(ai_faction)
                     or treaty == "current_treaty_client_of_player"
                     or treaty == "current_treaty_vassal"
                     or treaty == "current_treaty_vassal_of_player" then
-                        -- Only count as overlord if they have MORE regions (we are the client)
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
                         if other_fac and other_fac:region_list():num_items() > my_regions then
                             overlord_key = other_key
@@ -419,33 +447,48 @@ local function CheckCascadePeace(ai_faction)
     end)
 
     if overlord_key then
-        local ai_wars = GetWarsForFaction(ai_key)
-        local overlord_wars = GetWarsForFaction(overlord_key)
-        for enemy_key, _ in pairs(ai_wars) do
-            if not overlord_wars[enemy_key] and enemy_key ~= overlord_key then
-                -- Block cascade if enemy is a coalition member targeting this faction
-                local is_coalition_member = false
-                for _, coal in ipairs(active_coalitions) do
-                    if coal.threat_key == ai_key then
-                        for _, member_key in ipairs(coal.members) do
-                            if member_key == enemy_key then
-                                is_coalition_member = true
-                                break
+        local overlord_wars_current = GetWarsForFaction(overlord_key)
+        local overlord_wars_previous = cascade_wars_previous[overlord_key] or {}
+
+        -- Find wars the overlord ENDED
+        local ended_wars = {}
+        for enemy_key, _ in pairs(overlord_wars_previous) do
+            if not overlord_wars_current[enemy_key] then
+                ended_wars[enemy_key] = true
+            end
+        end
+
+        -- Update snapshot
+        cascade_wars_previous[overlord_key] = overlord_wars_current
+
+        if next(ended_wars) then
+            local ai_wars = GetWarsForFaction(ai_key)
+            for enemy_key, _ in pairs(ai_wars) do
+                if ended_wars[enemy_key] and enemy_key ~= overlord_key then
+                    -- Block cascade if enemy is a coalition member targeting this faction
+                    local is_coalition_member = false
+                    for _, coal in ipairs(active_coalitions) do
+                        if coal.threat_key == ai_key then
+                            for _, member_key in ipairs(coal.members) do
+                                if member_key == enemy_key then
+                                    is_coalition_member = true
+                                    break
+                                end
                             end
                         end
+                        if is_coalition_member then break end
                     end
-                    if is_coalition_member then break end
-                end
 
-                if not is_coalition_member then
-                    pcall(function()
-                        cm:force_make_peace(ai_key, enemy_key)
-                    end)
-                    Log("CASCADE PEACE: " .. ai_key .. " <-> " .. enemy_key
-                        .. " (overlord " .. overlord_key .. " at peace)")
-                else
-                    Log("CASCADE PEACE: BLOCKED " .. ai_key .. " <-> " .. enemy_key
-                        .. " (active coalition member vs " .. ai_key .. ")")
+                    if not is_coalition_member then
+                        pcall(function()
+                            cm:force_make_peace(ai_key, enemy_key)
+                        end)
+                        Log("CASCADE PEACE: " .. ai_key .. " <-> " .. enemy_key
+                            .. " (overlord " .. overlord_key .. " ended war this turn)")
+                    else
+                        Log("CASCADE PEACE: BLOCKED " .. ai_key .. " <-> " .. enemy_key
+                            .. " (active coalition member vs " .. ai_key .. ")")
+                    end
                 end
             end
         end
@@ -490,6 +533,10 @@ local function CheckClientStateGrowth(ai_faction)
                         local client_key, overlord_key, client_regions, overlord_regions
                         if my_regions < other_regions then
                             -- I am the client, they are the overlord
+                            -- Skip if the "overlord" is human — don't break player's treaties
+                            if IsHumanFaction(other_key) then
+                                return
+                            end
                             client_key = ai_key
                             overlord_key = other_key
                             client_regions = my_regions
@@ -887,7 +934,7 @@ end
    -- end
 --end
 
-local function FormCoalition(threat_key, members, turn)
+local function FormCoalition(threat_key, members, turn, trigger_score)
     local is_ai_target = not IsHumanFaction(threat_key)
     local peace_lock = 0
     if is_ai_target then
@@ -901,7 +948,8 @@ local function FormCoalition(threat_key, members, turn)
         members = members,
         formed_turn = turn,
         peace_lock_until = peace_lock,
-        is_ai_target = is_ai_target
+        is_ai_target = is_ai_target,
+        trigger_score = trigger_score or 0
     }
 
     table.insert(active_coalitions, coalition)
@@ -1311,7 +1359,7 @@ local function EvaluateCoalitions()
             else
                 Log("COALITION INVITE: Player declined — forming AI-only coalition vs " .. threat_key)
             end
-            FormCoalition(threat_key, valid_members, turn)
+            FormCoalition(threat_key, valid_members, turn, invite.trigger_score)
 
             -- PLAYER-SPECIFIC: Extra protections when player joined the coalition
             if coalition_invite_player_choice == true then
@@ -1391,14 +1439,6 @@ local function EvaluateCoalitions()
 
     Log("COALITION: Evaluating threat (turn " .. coalition_snapshot_turn .. " -> " .. turn .. ")")
 
-    -- Decay all existing threat scores
-    for fkey, score in pairs(faction_threat_scores) do
-        faction_threat_scores[fkey] = score * (1 - THREAT_DECAY)
-        if faction_threat_scores[fkey] < 0.5 then
-            faction_threat_scores[fkey] = nil
-        end
-    end
-
     -- Gather world averages (only 3+ region factions count toward averages)
     local total_size = 0
     local total_growth = 0
@@ -1427,7 +1467,10 @@ local function EvaluateCoalitions()
     end)
 
     if faction_count < 2 then
-        TakeCoalitionSnapshot()
+        -- Only reset baseline on window boundary
+        if (turn - coalition_snapshot_turn) >= THREAT_GROWTH_WINDOW then
+            TakeCoalitionSnapshot()
+        end
         return
     end
 
@@ -1438,21 +1481,22 @@ local function EvaluateCoalitions()
         .. " avg_growth=" .. string.format("%.2f", avg_growth))
 
     -- Calculate threat relative to world averages
+    -- ALL factions accumulate threat (not gated by MIN_REGIONS)
+    -- MIN_REGIONS only gates coalition FORMATION
     local threats = {}
 
     for fkey, wd in pairs(world_data) do
-        local dominated = false
-
-        if not COALITION_INCLUDE_HUMAN and wd.is_human then dominated = true end
-        if not dominated and IsInAnyCoalition(fkey) then dominated = true end
-        if not dominated and wd.size < COALITION_MIN_REGIONS then dominated = true end
+        -- skip checks: already in coalition, cooldown, or human excluded
+        local skip_accumulation = false
+        if not COALITION_INCLUDE_HUMAN and wd.is_human then skip_accumulation = true end
+        if not skip_accumulation and IsInAnyCoalition(fkey) then skip_accumulation = true end
 
         local cd = coalition_cooldowns[fkey] or 0
-        if not dominated and cd > 0 and (turn - cd) < COALITION_COOLDOWN then
-            dominated = true
+        if not skip_accumulation and cd > 0 and (turn - cd) < COALITION_COOLDOWN then
+            skip_accumulation = true
         end
 
-        if not dominated then
+        if not skip_accumulation then
             local growth_component = 0
             local size_component = 0
 
@@ -1488,34 +1532,45 @@ local function EvaluateCoalitions()
                     .. " s=" .. string.format("%.1f", size_component)
                     .. " | " .. math.floor(old_score) .. " -> " .. math.floor(new_score))
 
-                if new_score >= THREAT_SEVERE_THRESHOLD then
-                    local size_roll = math.random()
-                    local t_min, t_max
-                    if new_score >= THREAT_SEVERE_THRESHOLD * 1.5 then
-                        t_min = 3
-                        t_max = (size_roll < 0.4) and 4 or 5
-                    elseif new_score >= THREAT_SEVERE_THRESHOLD * 1.2 then
-                        t_min = 3
-                        t_max = (size_roll < 0.7) and 4 or 5
-                    else
-                        t_min = 2
-                        t_max = (size_roll < 0.5) and 3 or 4
+                -- Only eligible for coalition formation if they meet MIN_REGIONS
+                if wd.size >= COALITION_MIN_REGIONS then
+                    if new_score >= THREAT_SEVERE_THRESHOLD then
+                        local size_roll = math.random()
+                        local t_min, t_max
+                        if new_score >= THREAT_SEVERE_THRESHOLD * 1.5 then
+                            t_min = 3
+                            t_max = (size_roll < 0.4) and 4 or 5
+                        elseif new_score >= THREAT_SEVERE_THRESHOLD * 1.2 then
+                            t_min = 3
+                            t_max = (size_roll < 0.7) and 4 or 5
+                        else
+                            t_min = 2
+                            t_max = (size_roll < 0.5) and 3 or 4
+                        end
+                        table.insert(threats, {key = fkey, growth = new_score, level = 2, is_human = wd.is_human, target_min = t_min, target_max = t_max})
+                        Log("COALITION: " .. fkey .. " SEVERE (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
+                    elseif new_score >= THREAT_MILD_THRESHOLD then
+                        local size_roll = math.random()
+                        local t_min = 2
+                        local t_max
+                        if new_score >= THREAT_MILD_THRESHOLD * 1.4 then
+                            t_max = (size_roll < 0.6) and 3 or 4
+                        else
+                            t_max = (size_roll < 0.8) and 2 or 3
+                        end
+                        table.insert(threats, {key = fkey, growth = new_score, level = 1, is_human = wd.is_human, target_min = t_min, target_max = t_max})
+                        Log("COALITION: " .. fkey .. " MILD (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
                     end
-                    table.insert(threats, {key = fkey, growth = new_score, level = 2, is_human = wd.is_human, target_min = t_min, target_max = t_max})
-                    Log("COALITION: " .. fkey .. " SEVERE (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
-                elseif new_score >= THREAT_MILD_THRESHOLD then
-                    local size_roll = math.random()
-                    local t_min = 2
-                    local t_max
-                    if new_score >= THREAT_MILD_THRESHOLD * 1.4 then
-                        t_max = (size_roll < 0.6) and 3 or 4
-                    else
-                        t_max = (size_roll < 0.8) and 2 or 3
-                    end
-                    table.insert(threats, {key = fkey, growth = new_score, level = 1, is_human = wd.is_human, target_min = t_min, target_max = t_max})
-                    Log("COALITION: " .. fkey .. " MILD (threat=" .. math.floor(new_score) .. ") -> target " .. t_min .. "-" .. t_max .. " members")
                 end
             end
+        end
+    end
+
+    -- Decay all scores AFTER gains (so this turn's expansion is fully counted)
+    for fkey, score in pairs(faction_threat_scores) do
+        faction_threat_scores[fkey] = score * (1 - THREAT_DECAY)
+        if faction_threat_scores[fkey] < 0.5 then
+            faction_threat_scores[fkey] = nil
         end
     end
 
@@ -1572,14 +1627,16 @@ local function EvaluateCoalitions()
                 end
 
                 if should_form then
-                    local old_threat = faction_threat_scores[threat.key] or 0
-                    faction_threat_scores[threat.key] = old_threat * THREAT_POST_TRIGGER
-                    Log("COALITION THREAT: " .. threat.key .. " reduced after trigger: " .. math.floor(old_threat) .. " -> " .. math.floor(old_threat * THREAT_POST_TRIGGER))
+                    -- threat.growth holds the pre-decay peak score from the gain loop
+                    local peak_threat = threat.growth
+                    local current_threat = faction_threat_scores[threat.key] or 0
+                    faction_threat_scores[threat.key] = current_threat * THREAT_POST_TRIGGER
+                    Log("COALITION THREAT: " .. threat.key .. " reduced after trigger: peak=" .. math.floor(peak_threat) .. " current=" .. math.floor(current_threat) .. " -> " .. math.floor(current_threat * THREAT_POST_TRIGGER))
 
                     coalition_formation_counts[threat.key] = prior_count + 1
 
                     if IsHumanFaction(threat.key) then
-                        table.insert(pending_player_coalitions, {threat_key = threat.key, members = members, turn = turn})
+                        table.insert(pending_player_coalitions, {threat_key = threat.key, members = members, turn = turn, trigger_score = peak_threat})
                         Log("COALITION: Queued coalition vs " .. threat.key .. " [" .. table.concat(members, ", ") .. "] for player turn start")
                     else
                         -- Check if player qualifies to be invited (only for AI threats)
@@ -1594,13 +1651,14 @@ local function EvaluateCoalitions()
                                 threat_key = threat.key,
                                 members = members,
                                 turn = turn,
-                                player_key = eligible_player
+                                player_key = eligible_player,
+                                trigger_score = peak_threat
                             }
                             coalition_invite_player_choice = nil
                             coalition_invite_dilemma_fired = false
                             Log("COALITION INVITE: Deferred coalition vs " .. threat.key .. " [" .. table.concat(members, ", ") .. "] — inviting player " .. eligible_player)
                         else
-                            FormCoalition(threat.key, members, turn)
+                            FormCoalition(threat.key, members, turn, peak_threat)
                         end
                     end
                     formed_this_cycle = true
@@ -1612,7 +1670,11 @@ local function EvaluateCoalitions()
         end
     end
 
-    TakeCoalitionSnapshot()
+    -- Only reset growth baseline on window boundary (every THREAT_GROWTH_WINDOW turns)
+    if (turn - coalition_snapshot_turn) >= THREAT_GROWTH_WINDOW then
+        TakeCoalitionSnapshot()
+        Log("COALITION: Baseline reset (window=" .. THREAT_GROWTH_WINDOW .. " turns)")
+    end
 end
 
 -- ============================================================================
@@ -1663,6 +1725,7 @@ local function SaveCoalitionData(context)
         scripting.game_interface:save_named_value(prefix .. "formed", coal.formed_turn, context)
         scripting.game_interface:save_named_value(prefix .. "peacelock", coal.peace_lock_until, context)
         scripting.game_interface:save_named_value(prefix .. "isai", coal.is_ai_target and 1 or 0, context)
+        scripting.game_interface:save_named_value(prefix .. "trigscore", math.floor(coal.trigger_score or 0), context)
         scripting.game_interface:save_named_value(prefix .. "membercount", #coal.members, context)
         for j, member in ipairs(coal.members) do
             scripting.game_interface:save_named_value(prefix .. "member_" .. j, member, context)
@@ -1752,6 +1815,7 @@ local function LoadCoalitionData(context)
         local formed = scripting.game_interface:load_named_value(prefix .. "formed", 0, context)
         local peacelock = scripting.game_interface:load_named_value(prefix .. "peacelock", 0, context)
         local isai_val = scripting.game_interface:load_named_value(prefix .. "isai", 0, context)
+        local trigscore = scripting.game_interface:load_named_value(prefix .. "trigscore", 0, context)
         local membercount = scripting.game_interface:load_named_value(prefix .. "membercount", 0, context)
 
         if threat ~= "" and membercount > 0 then
@@ -1766,7 +1830,8 @@ local function LoadCoalitionData(context)
                     members = members,
                     formed_turn = formed,
                     peace_lock_until = peacelock,
-                    is_ai_target = (isai_val == 1)
+                    is_ai_target = (isai_val == 1),
+                    trigger_score = trigscore
                 })
             end
         end
@@ -2586,7 +2651,7 @@ local function OnFactionTurn(context)
     -- On player turn: form any queued coalitions and show notification
     if fac:is_human() and #pending_player_coalitions > 0 then
         for _, pending in ipairs(pending_player_coalitions) do
-            FormCoalition(pending.threat_key, pending.members, pending.turn)
+            FormCoalition(pending.threat_key, pending.members, pending.turn, pending.trigger_score)
             Log("COALITION: Formed queued coalition vs " .. pending.threat_key .. " at player turn start")
         end
         pending_player_coalitions = {}
@@ -2785,11 +2850,8 @@ local function OnFactionTurn(context)
                 Log("PEACE OFFER: Player REFUSED peace with " .. asker .. " — war continues")
             else
                 -- Choice still nil — player may have closed the dilemma without clicking
-                -- Force peace as safety fallback (same as old behavior)
-                if IsFactionAlive(asker) and AreAtWar(asker, target) then
-                    pcall(function() cm:force_make_peace(asker, target) end)
-                    Log("PEACE OFFER: No click detected — forcing peace with " .. asker .. " as fallback")
-                end
+                -- Treat as refusal — never force peace without explicit player acceptance
+                Log("PEACE OFFER: No click detected — treating as refusal for " .. asker)
             end
 
             -- Clean up
@@ -2886,7 +2948,7 @@ local function OnFactionTurn(context)
             Log("COALITION INVITE ERROR: trigger_custom_dilemma failed: " .. tostring(err_dilemma))
             -- Form coalition without player
             if #invite.members >= COALITION_MIN_MEMBERS then
-                FormCoalition(invite.threat_key, invite.members, invite.turn)
+                FormCoalition(invite.threat_key, invite.members, invite.turn, invite.trigger_score)
             end
             pending_coalition_invite = nil
             coalition_invite_player_choice = nil
@@ -2921,6 +2983,7 @@ local function OnLoad(context)
     last_calc = {}
     coalition_reapplied_after_load = false
     coalition_checked_this_turn = false
+    cascade_wars_previous = {}
     LoadCoalitionData(context)
     loaded_from_save = true
     Log("game loaded - coalition data restored")
@@ -2940,10 +3003,13 @@ local function OnNewCampaign(context)
     coalition_snapshots = {}
     coalition_snapshot_turn = 0
     coalition_cooldowns = {}
+    coalition_formation_counts = {}
+    faction_threat_scores = {}
     coalition_war_overrides = {}
     active_coalitions = {}
     coalition_reapplied_after_load = true
     coalition_checked_this_turn = false
+    cascade_wars_previous = {}
     pending_player_peace_offers = {}
     awaiting_peace_response = nil
     last_peace_dilemma_turn = 0

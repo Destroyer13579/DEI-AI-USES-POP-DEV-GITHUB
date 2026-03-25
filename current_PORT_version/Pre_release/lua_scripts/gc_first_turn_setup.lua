@@ -48,7 +48,7 @@ local function gc_FirstTurnSetup(context)
 	scripting.game_interface:cai_strategic_stance_manager_promote_specified_stance_towards_target_faction("rom_carthage", "rom_rome", "CAI_STRATEGIC_STANCE_NEUTRAL");
 	scripting.game_interface:cai_strategic_stance_manager_promote_specified_stance_towards_target_faction("rom_rome", "rom_carthage", "CAI_STRATEGIC_STANCE_NEUTRAL");
 	scripting.game_interface:cai_strategic_stance_manager_promote_specified_stance_towards_target_faction("rom_rome", "rom_syracuse", "CAI_STRATEGIC_STANCE_BITTER_ENEMIES");
-	scripting.game_interface:cai_strategic_stance_manager_promote_specified_stance_towards_target_faction("rom_syracuse", "rom_rome", "CAI_STRATEGIC_STANCE_BITTER_ENEMIES");
+	scripting.game_interface:cai_strategic_stance_manager_promote_specified_stance_towards_target_faction("rom_syracuse", "rom_rome", "CAI_STRATEGIC_STANCE_NEUTRAL");
 
 	if not contains("rom_maurya", player_factions) and not contains("rom_baktria", player_factions) then
 		scripting.game_interface:cai_strategic_stance_manager_promote_specified_stance_towards_target_faction("rom_maurya", "rom_baktria", "CAI_STRATEGIC_STANCE_BITTER_ENEMIES");
