@@ -1548,12 +1548,12 @@ local function CheckMemberThreat()
                                 .. "An envoy from " .. threat_target_name .. " has arrived and is offering peace between"
                                 .. " the two of you so they may refocus their efforts  on " .. threat_member_name .. ".\n\n"
                                 .. "As the only other member, you can choose to dissolve the coalition and make peace.\n\n"
-                                .. "Accept: The coalition dissolves. You make peace with " .. threat_target_name .. ".\n"
+                                .. "Accept: The coalition dissolves. You alone make peace with " .. threat_target_name .. ".\n"
                                 .. "Refuse: The coalition remains as-is."
                         else
                             member_threat_dilemma_text = "Your coalition ally " .. threat_member_name
                                 .. " has grown alarmingly powerful during the war against " .. threat_target_name .. ".\n\n"
-                                .. "The other AI members want to leave the coalition.\n\n"
+                                .. "The other members have asked you in secret if you share their desire to disband the coalition.\n\n"
                                 .. "Accept: You leave too. Everyone makes peace except " .. threat_member_name .. ".\n"
                                 .. "Refuse: You stay in a reduced coalition with " .. threat_member_name .. "."
                         end
@@ -3390,13 +3390,6 @@ local function OnFactionTurn(context)
 
                         -- Update coalition to just player + overgrown member
                         coal.members = remaining
-                        -- Reset peace lock for the smaller coalition
-                        local current_turn = scripting.game_interface:model():turn_number()
-                        if coal.is_ai_target then
-                            coal.peace_lock_until = current_turn + COALITION_AI_PEACE_LOCK
-                        else
-                            coal.peace_lock_until = current_turn + COALITION_PLAYER_PEACE_LOCK
-                        end
                         -- Update snapshots to only include remaining members
                         local new_snapshots = {}
                         for _, mk in ipairs(remaining) do
