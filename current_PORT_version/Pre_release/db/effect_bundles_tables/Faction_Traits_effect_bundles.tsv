@@ -49,3 +49,5 @@ dei_peace_offer_accepted	Peace has been accepted.	Peace Accepted	diplomacy_posit
 dei_peace_offer_refused	The people rally behind the war effort.	War Continues	diplomacy_negative.png	faction
 dei_coalition_invite_joined	Our armies march alongside allies.	Coalition Member	diplomacy_positive.png	faction
 dei_coalition_invite_declined	We chose neutrality.	Neutral Stance	diplomacy_positive.png	faction
+dei_member_threat_dissolved	The coalition crumbles as an ally grows too powerful.	Coalition Dissolved	diplomacy_negative.png	faction
+dei_member_threat_remained	We stand firm despite the growing power of our ally.	Coalition Holds	diplomacy_positive.png	faction

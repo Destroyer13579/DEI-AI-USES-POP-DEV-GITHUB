@@ -98,6 +98,16 @@ local coalition_player_dissolved_title_override = false  -- when true, dissoluti
 local COALITION_PLAYER_INVITE_COOLDOWN = 10  -- min turns between coalition invites to the player
 local last_coalition_invite_turn = 0         -- turn when player last left or was invited to a coalition
 
+-- member threat dissolution system
+local MEMBER_THREAT_RATIO = 0.3              -- member growth delta threshold = trigger_score * this
+local MEMBER_THREAT_CHANCE_BASE = 0.15       -- base probability when threshold first crossed
+local MEMBER_THREAT_CHANCE_SCALE = 0.35      -- probability scaling with overshoot
+local MEMBER_THREAT_CHANCE_CAP = 0.85        -- maximum probability per turn
+local pending_member_threat = nil            -- {coal_index, threat_member_key, player_key, player_role} — deferred for player prompt
+local member_threat_player_choice = nil      -- nil=pending, true=dissolve, false=remain
+local member_threat_dilemma_text = ""        -- dynamic text for member threat popup
+local member_threat_dilemma_fired = false    -- true after dilemma has been shown this cycle
+
 -- ============================================================================
 -- BRIDGE FUNCTIONS (global, for faction_rankings.lua to read coalition state)
 -- ============================================================================
@@ -957,8 +967,14 @@ local function FormCoalition(threat_key, members, turn, trigger_score)
         formed_turn = turn,
         peace_lock_until = peace_lock,
         is_ai_target = is_ai_target,
-        trigger_score = trigger_score or 0
+        trigger_score = trigger_score or 0,
+        member_threat_snapshots = {}
     }
+
+    -- Snapshot each member's threat score at formation time
+    for _, mk in ipairs(members) do
+        coalition.member_threat_snapshots[mk] = faction_threat_scores[mk] or 0
+    end
 
     table.insert(active_coalitions, coalition)
 
@@ -1296,6 +1312,279 @@ local function CheckCoalitionDissolution()
     end
 end
 
+-- Dissolve coalition due to a member growing too powerful
+-- The overgrown member stays at war with the target; everyone else makes peace
+local function DissolveMemberThreat(coal_index, threat_member_key)
+    local coal = active_coalitions[coal_index]
+    if not coal then return end
+
+    Log("MEMBER THREAT DISSOLVING: " .. threat_member_key .. " grew too powerful in coalition vs " .. coal.threat_key)
+
+    -- Make peace for all members EXCEPT the overgrown one
+    for _, member_key in ipairs(coal.members) do
+        if member_key ~= threat_member_key then
+            pcall(function()
+                scripting.game_interface:force_diplomacy(member_key, coal.threat_key, "peace", true, true)
+                scripting.game_interface:force_diplomacy(coal.threat_key, member_key, "peace", true, true)
+            end)
+            pcall(function()
+                cm:force_make_peace(member_key, coal.threat_key)
+            end)
+            Log("MEMBER THREAT PEACE: " .. member_key .. " <-> " .. coal.threat_key)
+            coalition_war_overrides[member_key] = nil
+        end
+    end
+
+    -- Remove coalition guardrails from the overgrown member (they stay at war but unprotected)
+    pcall(function()
+        scripting.game_interface:force_diplomacy(threat_member_key, coal.threat_key, "peace", true, true)
+        scripting.game_interface:force_diplomacy(coal.threat_key, threat_member_key, "peace", true, true)
+    end)
+    coalition_war_overrides[threat_member_key] = nil
+    Log("MEMBER THREAT: " .. threat_member_key .. " stays at war with " .. coal.threat_key .. " (no guardrails)")
+
+    -- Peace cascades to threat's client states for non-overgrown members
+    local threat_clients = GetClientStates(coal.threat_key)
+    for _, client_key in ipairs(threat_clients) do
+        for _, member_key in ipairs(coal.members) do
+            if member_key ~= threat_member_key then
+                pcall(function()
+                    scripting.game_interface:force_diplomacy(member_key, client_key, "peace", true, true)
+                    scripting.game_interface:force_diplomacy(client_key, member_key, "peace", true, true)
+                end)
+                pcall(function()
+                    cm:force_make_peace(member_key, client_key)
+                end)
+            end
+        end
+    end
+
+    -- Player defense cleanup (same as DissolveCoalition but skip overgrown member)
+    if IsHumanFaction(coal.threat_key) then
+        local player_allies = {}
+        pcall(function()
+            local player_fac = scripting.game_interface:model():world():faction_by_key(coal.threat_key)
+            if not player_fac then return end
+            local treaties = player_fac:treaty_details()
+            if not treaties then return end
+            for other_faction, treaty_list in pairs(treaties) do
+                local other_key = GetFactionKey(other_faction)
+                if other_key and not IsSlaveFaction(other_key) and not IsHumanFaction(other_key) and type(treaty_list) == "table" then
+                    for _, treaty in ipairs(treaty_list) do
+                        if treaty == "current_treaty_military_alliance"
+                        or treaty == "current_treaty_defensive_alliance" then
+                            player_allies[other_key] = true
+                            break
+                        end
+                    end
+                end
+            end
+        end)
+        for ally_key, _ in pairs(player_allies) do
+            for _, member_key in ipairs(coal.members) do
+                if member_key ~= threat_member_key and AreAtWar(ally_key, member_key) then
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(ally_key, member_key, "peace", true, true)
+                        scripting.game_interface:force_diplomacy(member_key, ally_key, "peace", true, true)
+                    end)
+                    pcall(function()
+                        cm:force_make_peace(ally_key, member_key)
+                    end)
+                end
+            end
+        end
+    end
+
+    -- Player-specific cleanup (re-enable war between player and former teammates)
+    for _, member_key in ipairs(coal.members) do
+        if IsHumanFaction(member_key) then
+            for _, other_key in ipairs(coal.members) do
+                if other_key ~= member_key then
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(member_key, other_key, "war", true, true)
+                        scripting.game_interface:force_diplomacy(other_key, member_key, "war", true, true)
+                    end)
+                end
+            end
+            -- Peace for player's client states with the threat (if player is not the overgrown one)
+            if member_key ~= threat_member_key then
+                local player_clients = GetClientStates(member_key)
+                for _, pclient in ipairs(player_clients) do
+                    pcall(function()
+                        scripting.game_interface:force_diplomacy(pclient, coal.threat_key, "peace", true, true)
+                        scripting.game_interface:force_diplomacy(coal.threat_key, pclient, "peace", true, true)
+                    end)
+                    pcall(function()
+                        cm:force_make_peace(pclient, coal.threat_key)
+                    end)
+                end
+            end
+            break
+        end
+    end
+
+    -- UI notifications
+    local threat_member_name = CleanFactionName(threat_member_key)
+    local threat_target_name = CleanFactionName(coal.threat_key)
+
+    if IsHumanFaction(coal.threat_key) then
+        -- Player is the target — they already chose to dissolve via prompt
+        coalition_dissolved_text = "The coalition against you has crumbled!\n\n"
+            .. threat_member_name .. " is now a threat in it's own right. "
+            .. "The other coalition members have withdrawn their support and have sued for peace.\n\n"
+            .. threat_member_name .. " remains at war with you — but now fights alone..."
+        coalition_dissolved_fired = false
+        coalition_notify_members = ""
+    elseif IsHumanFaction(threat_member_key) then
+        -- Player is the overgrown member (scenario 3)
+        coalition_dissolved_text = "Your rapid expansion has alarmed your coalition allies!\n\n"
+            .. "They have abandoned the war against " .. threat_target_name .. " and dissolved the coalition behind your back.\n\n"
+            .. "You remain at war with " .. threat_target_name .. " — but now fight alone..."
+        coalition_dissolved_fired = false
+        coalition_player_dissolved_title_override = true
+    else
+        -- Check if player was a non-overgrown member (they already chose via prompt)
+        local player_was_member = false
+        for _, mk in ipairs(coal.members) do
+            if IsHumanFaction(mk) and mk ~= threat_member_key then
+                player_was_member = true
+                break
+            end
+        end
+        if player_was_member then
+            coalition_dissolved_text = "The coalition against " .. threat_target_name .. " has dissolved.\n\n"
+                .. threat_member_name .. " grew too powerful. All other coalition members are standing down.\n\n"
+                .. threat_member_name .. " remains at war with " .. threat_target_name .. " — but now fights alone..."
+            coalition_dissolved_fired = false
+            coalition_player_dissolved_title_override = true
+            last_coalition_invite_turn = scripting.game_interface:model():turn_number()
+        else
+            -- Player is uninvolved — general notification via dissolution popup
+            coalition_dissolved_text = "A coalition against " .. threat_target_name .. " has suddenly disbanded!\n\n"
+                .. threat_member_name .. ", once an ally in the coalition, grew too powerful. "
+                .. "Refusing to fuel another tyrant, the other members have made peace — but " .. threat_member_name
+                .. " continues the war alone..."
+            coalition_dissolved_fired = false
+        end
+    end
+
+    Log("*** COALITION DISSOLVED (MEMBER THREAT): " .. threat_member_key .. " in coalition vs " .. coal.threat_key .. " ***")
+
+    local current_turn = scripting.game_interface:model():turn_number()
+    coalition_cooldowns[coal.threat_key] = current_turn
+    table.remove(active_coalitions, coal_index)
+end
+
+-- Check if any coalition member has grown too powerful and should trigger dissolution
+local function CheckMemberThreat()
+    if pending_member_threat then return end  -- already waiting for player response
+
+    for i = #active_coalitions, 1, -1 do
+        repeat  -- Lua 5.1 continue idiom
+        local coal = active_coalitions[i]
+        local trigger = coal.trigger_score or 0
+        if trigger <= 0 then break end
+
+        local threshold = trigger * MEMBER_THREAT_RATIO
+        local snapshots = coal.member_threat_snapshots or {}
+
+        for _, member_key in ipairs(coal.members) do
+            local current_score = faction_threat_scores[member_key] or 0
+            local baseline = snapshots[member_key] or 0
+            local growth_delta = current_score - baseline
+
+            if growth_delta > threshold then
+                -- Probability roll
+                local overshoot = (growth_delta - threshold) / threshold
+                local chance = math.min(MEMBER_THREAT_CHANCE_BASE + overshoot * MEMBER_THREAT_CHANCE_SCALE, MEMBER_THREAT_CHANCE_CAP)
+                local roll = math.random()
+
+                Log("MEMBER THREAT CHECK: " .. member_key .. " in coalition vs " .. coal.threat_key
+                    .. " delta=" .. string.format("%.1f", growth_delta) .. " threshold=" .. string.format("%.1f", threshold)
+                    .. " chance=" .. string.format("%.2f", chance) .. " roll=" .. string.format("%.2f", roll))
+
+                if roll < chance then
+                    -- Determine player involvement
+                    local player_is_target = IsHumanFaction(coal.threat_key)
+                    local player_is_overgrown = IsHumanFaction(member_key)
+                    local player_is_other_member = false
+                    local player_key = nil
+                    for _, mk in ipairs(coal.members) do
+                        if IsHumanFaction(mk) and mk ~= member_key then
+                            player_is_other_member = true
+                            player_key = mk
+                            break
+                        end
+                    end
+
+                    if player_is_target then
+                        -- Scenario 1: prompt the target player
+                        local threat_member_name = CleanFactionName(member_key)
+                        member_threat_dilemma_text = "One of your enemies has grown dangerously powerful!\n\n"
+                            .. threat_member_name .. " has been expanding rapidly during the coalition war against you. "
+                            .. "The other coalition members have now begun plotting against them, and offer to disband the coalition.\n\n"
+                            .. "If you agree, the coalition will dissolve — the weaker members will sue for peace. "
+                            .. "You will remain at war with " .. threat_member_name .. ".\n\n"
+                            .. "Refuse, and the coalition remains intact."
+                        pending_member_threat = {
+                            coal_index = i,
+                            threat_member_key = member_key,
+                            player_key = coal.threat_key,
+                            player_role = "target"
+                        }
+                        member_threat_player_choice = nil
+                        member_threat_dilemma_fired = false
+                        Log("MEMBER THREAT: Deferred — prompting target player " .. coal.threat_key)
+                        return  -- only one at a time
+
+                    elseif player_is_other_member then
+                        -- Scenario 2: prompt the non-overgrown player member
+                        local threat_member_name = CleanFactionName(member_key)
+                        local threat_target_name = CleanFactionName(coal.threat_key)
+                        local is_two_member = (#coal.members == 2)
+                        if is_two_member then
+                            member_threat_dilemma_text = "Your coalition ally " .. threat_member_name
+                                .. " has grown alarmingly powerful during the war against " .. threat_target_name .. "."
+                                .. "An envoy from " .. threat_target_name .. " has arrived and is offering peace between"
+                                .. " the two of you so they may refocus their efforts  on " .. threat_member_name .. ".\n\n"
+                                .. "As the only other member, you can choose to dissolve the coalition and make peace.\n\n"
+                                .. "Accept: The coalition dissolves. You make peace with " .. threat_target_name .. ".\n"
+                                .. "Refuse: The coalition remains as-is."
+                        else
+                            member_threat_dilemma_text = "Your coalition ally " .. threat_member_name
+                                .. " has grown alarmingly powerful during the war against " .. threat_target_name .. ".\n\n"
+                                .. "The other AI members want to leave the coalition.\n\n"
+                                .. "Accept: You leave too. Everyone makes peace except " .. threat_member_name .. ".\n"
+                                .. "Refuse: You stay in a reduced coalition with " .. threat_member_name .. "."
+                        end
+                        pending_member_threat = {
+                            coal_index = i,
+                            threat_member_key = member_key,
+                            player_key = player_key,
+                            player_role = "member"
+                        }
+                        member_threat_player_choice = nil
+                        member_threat_dilemma_fired = false
+                        Log("MEMBER THREAT: Deferred — prompting member player " .. player_key)
+                        return
+
+                    elseif player_is_overgrown then
+                        -- Scenario 3: player is the overgrown member — no choice, just dissolve
+                        DissolveMemberThreat(i, member_key)
+                        return
+
+                    else
+                        -- Scenario 4: no human involved or human uninvolved
+                        DissolveMemberThreat(i, member_key)
+                        return
+                    end
+                end
+            end
+        end
+        until true
+    end
+end
+
 local function CheckPeaceLocks(turn)
     for _, coal in ipairs(active_coalitions) do
         if coal.peace_lock_until > 0 and turn >= coal.peace_lock_until then
@@ -1340,8 +1629,9 @@ local function EvaluateCoalitions()
 
     local turn = scripting.game_interface:model():turn_number()
 
-    -- always check dissolution and peace locks
+    -- always check dissolution, member threat, and peace locks
     CheckCoalitionDissolution()
+    CheckMemberThreat()
     CheckPeaceLocks(turn)
 
     -- Process deferred coalition invite (player was invited last turn)
@@ -1744,6 +2034,14 @@ local function SaveCoalitionData(context)
         for j, member in ipairs(coal.members) do
             scripting.game_interface:save_named_value(prefix .. "member_" .. j, member, context)
         end
+        -- Save member threat snapshots
+        local mts_count = 0
+        for mk, sv in pairs(coal.member_threat_snapshots or {}) do
+            scripting.game_interface:save_named_value(prefix .. "mts_key_" .. mts_count, mk, context)
+            scripting.game_interface:save_named_value(prefix .. "mts_val_" .. mts_count, math.floor(sv * 100), context)
+            mts_count = mts_count + 1
+        end
+        scripting.game_interface:save_named_value(prefix .. "mts_count", mts_count, context)
     end
 
     Log("COALITION SAVE: " .. snap_count .. " snapshots, " .. cd_count .. " cooldowns, " .. fc_count .. " formation counts, " .. ts_count .. " threats, " .. #active_coalitions .. " coalitions")
@@ -1839,13 +2137,22 @@ local function LoadCoalitionData(context)
                 if m ~= "" then table.insert(members, m) end
             end
             if #members > 0 then
+                -- Load member threat snapshots
+                local mts = {}
+                local mts_count = scripting.game_interface:load_named_value(prefix .. "mts_count", 0, context)
+                for mi = 0, mts_count - 1 do
+                    local mk = scripting.game_interface:load_named_value(prefix .. "mts_key_" .. mi, "", context)
+                    local mv = scripting.game_interface:load_named_value(prefix .. "mts_val_" .. mi, 0, context)
+                    if mk ~= "" then mts[mk] = mv / 100 end
+                end
                 table.insert(active_coalitions, {
                     threat_key = threat,
                     members = members,
                     formed_turn = formed,
                     peace_lock_until = peacelock,
                     is_ai_target = (isai_val == 1),
-                    trigger_score = trigscore
+                    trigger_score = trigscore,
+                    member_threat_snapshots = mts
                 })
             end
         end
@@ -2141,7 +2448,7 @@ pcall(function()
 end)
 
 local function TryInjectCoalitionText()
-    if coalition_notify_members == "" and coalition_ai_notify_text == "" and coalition_dissolved_text == "" then return end
+    if coalition_notify_members == "" and coalition_ai_notify_text == "" and coalition_dissolved_text == "" and member_threat_dilemma_text == "" then return end
 
     local ok_ui, err_ui = pcall(function()
         local ui_root = cached_ui_root
@@ -2487,6 +2794,37 @@ local function TryInjectCoalitionInviteText()
     end
 end
 
+local function TryInjectMemberThreatText()
+    if member_threat_dilemma_text == "" then return end
+
+    local ok_ui, err_ui = pcall(function()
+        local ui_root = cached_ui_root
+        if not ui_root then return end
+
+        local ok_v, _ = pcall(function() return ui_root:Id() end)
+        if not ok_v then cached_ui_root = nil; return end
+
+        local dy_descr = FindUIComponent(ui_root, "event_dilemma", "description", "dy_descr_text")
+        if dy_descr then
+            dy_descr:SetStateText(member_threat_dilemma_text)
+            Log("MEMBER THREAT UI: Injected dynamic text into dilemma popup")
+        end
+
+        local dy_effect = FindUIComponent(ui_root, "event_dilemma", "dilemma1_window", "dilemma1_template", "effect_window1", "effect1", "dy_effect")
+        if dy_effect then
+            dy_effect:SetStateText("Dissolve Coalition")
+        end
+
+        local dy_effect2 = FindUIComponent(ui_root, "event_dilemma", "dilemma2_window", "dilemma2_template", "effect_window1", "effect1", "dy_effect")
+        if dy_effect2 then
+            dy_effect2:SetStateText("Keep Coalition")
+        end
+    end)
+    if not ok_ui then
+        Log("MEMBER THREAT UI: injection failed: " .. tostring(err_ui))
+    end
+end
+
 local panel_listener_registered = false
 
 local function OnFactionTurn(context)
@@ -2501,10 +2839,9 @@ local function OnFactionTurn(context)
             dilemma_listener_registered = true
             local ok_dilemma_evt, err_dilemma_evt = pcall(function()
                 scripting.AddEventCallBack("DilemmaChoiceMadeEvent", function(dilemma_context)
-                    if not awaiting_peace_response then return end
                     pcall(function()
                         local dilemma_key = dilemma_context:dilemma()
-                        if dilemma_key == "dei_dilemma_AI_OFFER_PEACE" then
+                        if dilemma_key == "dei_dilemma_AI_OFFER_PEACE" and awaiting_peace_response then
                             local choice = dilemma_context:choice()
                             if choice == 0 then
                                 peace_offer_player_choice = true
@@ -2512,6 +2849,15 @@ local function OnFactionTurn(context)
                             else
                                 peace_offer_player_choice = false
                                 Log("PEACE OFFER EVENT: Player chose REFUSE (choice=" .. tostring(choice) .. ")")
+                            end
+                        elseif dilemma_key == "dei_dilemma_MEMBER_THREAT" and pending_member_threat then
+                            local choice = dilemma_context:choice()
+                            if choice == 0 then
+                                member_threat_player_choice = true
+                                Log("MEMBER THREAT EVENT: Player chose DISSOLVE (choice=0)")
+                            else
+                                member_threat_player_choice = false
+                                Log("MEMBER THREAT EVENT: Player chose REMAIN (choice=" .. tostring(choice) .. ")")
                             end
                         end
                     end)
@@ -2655,6 +3001,12 @@ local function OnFactionTurn(context)
                 if coalition_invite_dilemma_text ~= "" then
                     Log("COALITION INVITE UI: PanelOpenedCampaign fired, injecting dilemma text")
                     TryInjectCoalitionInviteText()
+                end
+
+                -- Inject member threat dilemma text if active
+                if member_threat_dilemma_text ~= "" then
+                    Log("MEMBER THREAT UI: PanelOpenedCampaign fired, injecting dilemma text")
+                    TryInjectMemberThreatText()
                 end
             end)
             Log("COALITION UI: PanelOpenedCampaign listener registered")
@@ -2924,6 +3276,146 @@ local function OnFactionTurn(context)
                 Log("PEACE OFFER: Cooldown active (" .. (current_turn - last_peace_dilemma_turn) .. "/" .. PLAYER_PEACE_DILEMMA_COOLDOWN .. " turns)")
             end
         end
+    end
+
+    -- ========================================================================
+    -- MEMBER THREAT DILEMMA SYSTEM (player turn only)
+    -- Fire dilemma if a coalition member grew too powerful and player needs to decide
+    -- ========================================================================
+    if fac:is_human() and pending_member_threat and not member_threat_dilemma_fired then
+        local mt = pending_member_threat
+        if fac:name() == mt.player_key then
+            member_threat_dilemma_fired = true
+            local ok_dilemma, err_dilemma = pcall(function()
+                scripting.game_interface:trigger_custom_dilemma(
+                    mt.player_key,
+                    "dei_dilemma_MEMBER_THREAT",
+                    "payload { effect_bundle { bundle_key dei_member_threat_dissolved; turns 5; } }",
+                    "payload { effect_bundle { bundle_key dei_member_threat_remained; turns 5; } }",
+                    true
+                )
+            end)
+            if ok_dilemma then
+                Log("MEMBER THREAT: Fired dei_dilemma_MEMBER_THREAT for " .. mt.player_key .. " (role=" .. mt.player_role .. ")")
+            else
+                Log("MEMBER THREAT ERROR: trigger_custom_dilemma failed: " .. tostring(err_dilemma))
+                -- Fallback: dissolve without player input
+                if mt.coal_index <= #active_coalitions then
+                    DissolveMemberThreat(mt.coal_index, mt.threat_member_key)
+                end
+                pending_member_threat = nil
+                member_threat_player_choice = nil
+                member_threat_dilemma_fired = false
+            end
+        end
+    end
+
+    -- Process member threat dilemma response
+    if fac:is_human() and pending_member_threat and member_threat_dilemma_fired and member_threat_player_choice ~= nil then
+        local mt = pending_member_threat
+        local coal_index = mt.coal_index
+
+        -- Validate coalition still exists at this index
+        local coal = active_coalitions[coal_index]
+        local valid = coal and coal.threat_key
+        -- Re-find if index shifted (coalitions may have been removed)
+        if not valid then
+            for ci = 1, #active_coalitions do
+                local c = active_coalitions[ci]
+                if c.threat_key == mt.threat_member_key or (c.members and c.threat_key) then
+                    -- Match by threat_key and member presence
+                    for _, mk in ipairs(c.members) do
+                        if mk == mt.threat_member_key then
+                            coal_index = ci
+                            coal = c
+                            valid = true
+                            break
+                        end
+                    end
+                end
+                if valid then break end
+            end
+        end
+
+        if valid then
+            if member_threat_player_choice == true then
+                -- Player chose to dissolve
+                if mt.player_role == "target" then
+                    -- Scenario 1: player is target, dissolve the coalition
+                    DissolveMemberThreat(coal_index, mt.threat_member_key)
+                elseif mt.player_role == "member" then
+                    -- Scenario 2: player is a non-overgrown member
+                    if #coal.members == 2 then
+                        -- 2-member coalition: full dissolution, overgrown stays at war
+                        DissolveMemberThreat(coal_index, mt.threat_member_key)
+                    else
+                        -- 3+ members: player and AI members leave, overgrown stays at war alone
+                        DissolveMemberThreat(coal_index, mt.threat_member_key)
+                    end
+                end
+            else
+                -- Player chose to remain
+                if mt.player_role == "target" then
+                    -- Scenario 1 decline: coalition stays as-is
+                    Log("MEMBER THREAT: Target player declined dissolution — coalition remains vs " .. coal.threat_key)
+                elseif mt.player_role == "member" then
+                    if #coal.members == 2 then
+                        -- 2-member coalition: stays as-is
+                        Log("MEMBER THREAT: Member player declined in 2-member coalition — coalition remains vs " .. coal.threat_key)
+                    else
+                        -- 3+ members: AI members leave, player stays with overgrown member
+                        -- Remove AI members (make peace), keep player + overgrown
+                        local remaining = {}
+                        local removed = {}
+                        for _, mk in ipairs(coal.members) do
+                            if mk == mt.threat_member_key or mk == mt.player_key then
+                                table.insert(remaining, mk)
+                            else
+                                table.insert(removed, mk)
+                            end
+                        end
+
+                        -- Make peace for removed members
+                        for _, mk in ipairs(removed) do
+                            pcall(function()
+                                scripting.game_interface:force_diplomacy(mk, coal.threat_key, "peace", true, true)
+                                scripting.game_interface:force_diplomacy(coal.threat_key, mk, "peace", true, true)
+                            end)
+                            pcall(function()
+                                cm:force_make_peace(mk, coal.threat_key)
+                            end)
+                            coalition_war_overrides[mk] = nil
+                            Log("MEMBER THREAT: " .. mk .. " leaves coalition, peace with " .. coal.threat_key)
+                        end
+
+                        -- Update coalition to just player + overgrown member
+                        coal.members = remaining
+                        -- Reset peace lock for the smaller coalition
+                        local current_turn = scripting.game_interface:model():turn_number()
+                        if coal.is_ai_target then
+                            coal.peace_lock_until = current_turn + COALITION_AI_PEACE_LOCK
+                        else
+                            coal.peace_lock_until = current_turn + COALITION_PLAYER_PEACE_LOCK
+                        end
+                        -- Update snapshots to only include remaining members
+                        local new_snapshots = {}
+                        for _, mk in ipairs(remaining) do
+                            new_snapshots[mk] = coal.member_threat_snapshots[mk] or (faction_threat_scores[mk] or 0)
+                        end
+                        coal.member_threat_snapshots = new_snapshots
+
+                        Log("MEMBER THREAT: Player stays — coalition shrunk to [" .. table.concat(remaining, ", ") .. "] vs " .. coal.threat_key)
+                    end
+                end
+            end
+        else
+            Log("MEMBER THREAT: Coalition no longer valid — skipping")
+        end
+
+        pending_member_threat = nil
+        member_threat_player_choice = nil
+        member_threat_dilemma_text = ""
+        member_threat_dilemma_fired = false
     end
 
     -- ========================================================================
