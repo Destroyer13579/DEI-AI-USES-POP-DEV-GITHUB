@@ -53,13 +53,13 @@ end
 
 --local function pop_log(line)
 
-	--local ok, f = pcall(io.open, POP_LOG_FILE, "a");
+--	local ok, f = pcall(io.open, POP_LOG_FILE, "a");
 	--if ok and f then
 	--	f:write(tostring(line) .. "\n");
 	--	f:close();
 	--else
 	--	out("POP_LOG_FALLBACK | " .. tostring(line));
-	--end
+--	end
 --end
 
 local function fmt_money(n)
@@ -200,4 +200,5 @@ function LogAITreasuryEndTurn(context)
 	end
 end
 
-scripting.AddEventCallBack("FactionTurnEnd", LogAITreasuryEndTurn);
+
+scripting.AddEventCallBack("FactionTurnEnd", TestPersonalitySwap);
