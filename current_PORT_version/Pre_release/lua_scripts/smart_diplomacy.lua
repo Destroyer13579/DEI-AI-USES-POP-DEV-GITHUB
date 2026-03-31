@@ -2005,8 +2005,9 @@ local function BlockWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
             scripting.game_interface:force_diplomacy(ai_key, hkey, "war", false, false)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", false, false)
         end)
-        Log("BLOCKED: " .. ai_key .. " -> " .. hkey)
+        Log("BLOCKED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
     end
     blocked_factions[ai_key] = true
 end
@@ -2015,8 +2016,9 @@ local function EnableWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
             scripting.game_interface:force_diplomacy(ai_key, hkey, "war", true, true)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", true, true)
         end)
-        Log("ENABLED: " .. ai_key .. " -> " .. hkey)
+        Log("ENABLED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
     end
     blocked_factions[ai_key] = false
 end
@@ -2241,9 +2243,9 @@ local function TryInjectCoalitionText()
                 title_text = tx_title:GetStateText() or ""
             end
 
-            local is_player_coalition = string.find(title_text, "AGAINST YOU")
-            local is_ai_coalition = string.find(title_text, "AI COALITION") or string.find(title_text, "COALITION JOINED")
-            local is_dissolved = string.find(title_text, "DISSOLVED")
+            local is_player_coalition = string.find(title_text, "Against You")
+            local is_ai_coalition = string.find(title_text, "Coalition Formed") or string.find(title_text, "Coalition Joined")
+            local is_dissolved = string.find(title_text, "Dissolved")
 
             if is_player_coalition and coalition_notify_members ~= "" then
                 -- PLAYER COALITION: split members into at-war vs peace-achieved
@@ -2302,13 +2304,13 @@ local function TryInjectCoalitionText()
                         dynamic_text = dynamic_text .. "Peace achieved: " .. table.concat(peace_names, ", ") .. "\n"
                     end
                     dynamic_text = dynamic_text .. "\n"
-                        .. "Peace LOCKED for " .. turns_left .. " more turn" .. (turns_left > 1 and "s" or "") .. "!\n\n"
+                        .. "Peace locked for " .. turns_left .. " more turn" .. (turns_left > 1 and "s" or "") .. "!\n\n"
                     if progress > 0 then
                         dynamic_text = dynamic_text
                             .. "Progress: " .. progress .. "/" .. dissolve_threshold .. " needed to disband\n"
                     end
                     dynamic_text = dynamic_text
-                        .. "Achieve peace with HALF to DISBAND the coalition!"
+                        .. "Achieve peace with half to disband the coalition!"
                 else
                     dynamic_text = "The coalition against you persists!\n\n"
                     if #at_war_names > 0 then
@@ -2327,7 +2329,7 @@ local function TryInjectCoalitionText()
                             .. "Progress: " .. progress .. "/" .. dissolve_threshold .. " needed to disband\n"
                     end
                     dynamic_text = dynamic_text
-                        .. "Achieve peace with HALF to DISBAND the coalition!"
+                        .. "Achieve peace with half to disband the coalition!"
                 end
 
                 dy_descr:SetStateText(dynamic_text)
@@ -2343,9 +2345,9 @@ local function TryInjectCoalitionText()
 
                 -- Override title if player joined this coalition
                 if coalition_player_joined_title_override and tx_title then
-                    tx_title:SetStateText("COALITION JOINED")
+                    tx_title:SetStateText("Coalition Joined")
                     coalition_player_joined_title_override = false
-                    Log("COALITION UI: Overrode title to 'COALITION JOINED'")
+                    Log("COALITION UI: Overrode title to 'Coalition Joined'")
                 end
 
             elseif is_dissolved and coalition_dissolved_text ~= "" then
@@ -2355,9 +2357,9 @@ local function TryInjectCoalitionText()
 
                 -- Override title if player was a coalition member
                 if coalition_player_dissolved_title_override and tx_title then
-                    tx_title:SetStateText("YOUR COALITION DISSOLVED")
+                    tx_title:SetStateText("Your Coalition Dissolved")
                     coalition_player_dissolved_title_override = false
-                    Log("COALITION UI: Overrode title to 'YOUR COALITION DISSOLVED'")
+                    Log("COALITION UI: Overrode title to 'Your Coalition Dissolved'")
                 end
 
             else
@@ -2740,7 +2742,7 @@ local function OnFactionTurn(context)
             .. "\n\nTarget: " .. threat_name
         if peace_turns > 0 then
             coalition_ai_notify_text = coalition_ai_notify_text
-                .. "\n\nPeace LOCKED for " .. peace_turns .. " turn" .. (peace_turns > 1 and "s" or "") .. "!"
+                .. "\n\nPeace locked for " .. peace_turns .. " turn" .. (peace_turns > 1 and "s" or "") .. "!"
         end
         coalition_ai_notify_text = coalition_ai_notify_text
             .. "\n\nYour armies now march alongside your allies! "
