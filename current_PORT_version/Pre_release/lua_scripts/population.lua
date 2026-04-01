@@ -32,7 +32,7 @@ _G.main_env = getfenv(1)
 -- LIBRARIES REQUIRED  ---------------------------------------------------------------------
 -- #####-------------------------
 
-require "lua_scripts.smart_economy"
+--   require "lua_scripts.smart_economy"
 require "lua_scripts.smart_diplomacy"
 -- require "lua_scripts.ai_personality_manager"
 local scripting = require "lua_scripts.EpisodicScripting"
