@@ -2046,9 +2046,9 @@ local function BlockWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
             scripting.game_interface:force_diplomacy(ai_key, hkey, "war", false, false)
-            -- scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", false, false)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", false, false)
         end)
-        Log("BLOCKED: " .. ai_key .. " -> " .. hkey .. " (war)")
+        Log("BLOCKED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
     end
     blocked_factions[ai_key] = true
 end
@@ -2057,9 +2057,9 @@ local function EnableWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
             scripting.game_interface:force_diplomacy(ai_key, hkey, "war", true, true)
-            -- scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", true, true)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", true, true)
         end)
-        Log("ENABLED: " .. ai_key .. " -> " .. hkey .. " (war)")
+        Log("ENABLED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
     end
     blocked_factions[ai_key] = false
 end
@@ -2071,7 +2071,6 @@ end
 local last_turn = 0
 local checks, blocked, allowed = 0, 0, 0
 local coalition_reapplied_after_load = false
-local nap_block_done = false  -- one-time NAP block on first player turn
 
 local function CheckFaction(ai_faction)
     local ai_key = ai_faction:name()
@@ -3020,26 +3019,6 @@ local function OnFactionTurn(context)
         end
     end
 
-    -- One-time batch NAP block on the player's first turn.
-    -- Cheaper than blocking NAP per-faction across 125 AI turns.
-    if fac:is_human() and not nap_block_done then
-        nap_block_done = true
-        local hkey = fac:name()
-        pcall(function()
-            local flist = scripting.game_interface:model():world():faction_list()
-            for i = 0, flist:num_items() - 1 do
-                local ai_fac = flist:item_at(i)
-                local ai_key = ai_fac:name()
-                if ai_key ~= hkey and not IsSlaveFaction(ai_key) then
-                    pcall(function()
-                        scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", false, false)
-                        scripting.game_interface:force_diplomacy(hkey, ai_key, "non aggression pact", false, false)
-                    end)
-                end
-            end
-        end)
-        Log("NAP BLOCK: Disabled NAP for all factions vs " .. hkey .. " (one-time batch)")
-    end
 
     if fac:is_human() then return end
     if not fac:has_home_region() then return end
