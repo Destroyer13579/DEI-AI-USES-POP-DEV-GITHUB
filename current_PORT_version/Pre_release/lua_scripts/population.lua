@@ -11558,7 +11558,6 @@ end
 -- ***** DEEP COPY ***** --
 
 function deepCopy(orig)
-PopLog("deep Copy start for table: "..tostring(orig))
 -- copy background numbers to UI tables
   local orig_type = type(orig);
   local copy;
@@ -11573,7 +11572,6 @@ PopLog("deep Copy start for table: "..tostring(orig))
   else -- number, string, boolean, etc
     copy = orig;
   end;
-  PopLog("deep Copy start for table: returned value")
   return copy;
 end;
 
