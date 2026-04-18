@@ -15,7 +15,9 @@ local scripting = require "lua_scripts.EpisodicScripting"
 
 -- distance war blocking
 local WAR_DISTANCE_THRESHOLD = 100
-local SLOW_CHECK_FREQUENCY = 4  -- how often (in turns) to recheck blocked factions and client state growth
+local SLOW_CHECK_FREQUENCY = 4      -- turns between rechecks for blocked factions
+local FAR_CHECK_FREQUENCY = 12      -- turns between rechecks for very distant factions
+local FAR_DISTANCE_THRESHOLD = 150  -- distance beyond which FAR_CHECK_FREQUENCY applies
 local LOG_ENABLED = false
 
 -- cascading peace
@@ -1965,6 +1967,7 @@ end
 -- ============================================================================
 
 local WAR_DISTANCE_THRESHOLD_SQ = WAR_DISTANCE_THRESHOLD * WAR_DISTANCE_THRESHOLD
+local FAR_DISTANCE_THRESHOLD_SQ = FAR_DISTANCE_THRESHOLD * FAR_DISTANCE_THRESHOLD
 
 local function CalcDistSqToHuman(ai_faction)
     local min_dist_sq = 99999 * 99999
@@ -2044,7 +2047,7 @@ end
 local function BlockWar(ai_key)
     for _, hkey in ipairs(human_factions) do
         pcall(function()
-            scripting.game_interface:force_diplomacy(ai_key, hkey, "war", false, true)
+            scripting.game_interface:force_diplomacy(ai_key, hkey, "war", false, false)
             scripting.game_interface:force_diplomacy(ai_key, hkey, "non aggression pact", false, false)
         end)
         Log("BLOCKED: " .. ai_key .. " -> " .. hkey .. " (war + NAP)")
@@ -2102,15 +2105,27 @@ local function CheckFaction(ai_faction)
     -- Cascade peace must run every turn to catch the exact turn a war ends
     CheckCascadePeace(ai_faction)
 
-    local is_slow_turn = (turn % SLOW_CHECK_FREQUENCY) == (math.abs(ai_key:byte(1)) % SLOW_CHECK_FREQUENCY)
+    local is_blocked = blocked_factions[ai_key] or false
 
-    -- Client state growth is slow-moving — only check every 3 turns
-    if is_slow_turn then
+    -- Determine check frequency for this faction:
+    -- Very distant blocked factions change slowly, check less often
+    local faction_freq = SLOW_CHECK_FREQUENCY
+    if is_blocked and not coalition_war_overrides[ai_key] then
+        local cached_dist_sq = dist_cache[ai_key]
+        if cached_dist_sq and cached_dist_sq > FAR_DISTANCE_THRESHOLD_SQ then
+            faction_freq = FAR_CHECK_FREQUENCY
+        end
+    end
+
+    local is_slow_turn = (turn % faction_freq) == (math.abs(ai_key:byte(1)) % faction_freq)
+    local is_growth_turn = (turn % SLOW_CHECK_FREQUENCY) == (math.abs(ai_key:byte(1)) % SLOW_CHECK_FREQUENCY)
+
+    -- Client state growth always uses SLOW_CHECK_FREQUENCY regardless of distance
+    if is_growth_turn then
         CheckClientStateGrowth(ai_faction)
     end
 
     -- Skip distance check for already-blocked distant factions
-    local is_blocked = blocked_factions[ai_key] or false
     if is_blocked and not coalition_war_overrides[ai_key] then
         if not is_slow_turn then
             blocked = blocked + 1
