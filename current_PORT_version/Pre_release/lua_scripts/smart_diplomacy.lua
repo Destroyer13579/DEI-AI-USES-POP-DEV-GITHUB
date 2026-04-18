@@ -15,7 +15,9 @@ local scripting = require "lua_scripts.EpisodicScripting"
 
 -- distance war blocking
 local WAR_DISTANCE_THRESHOLD = 100
-local RECALC_FREQUENCY = 1
+local SLOW_CHECK_FREQUENCY = 4      -- turns between rechecks for blocked factions
+local FAR_CHECK_FREQUENCY = 12      -- turns between rechecks for very distant factions
+local FAR_DISTANCE_THRESHOLD = 150  -- distance beyond which FAR_CHECK_FREQUENCY applies
 local LOG_ENABLED = false
 
 -- cascading peace
@@ -57,7 +59,11 @@ local COALITION_DISSOLVE_RATIO = 0.5
 
 local blocked_factions = {}
 local human_factions = {}
-local last_calc = {}
+
+-- Distance cache: keyed by faction name, stores squared distance to nearest human region.
+-- Wiped at the start of each new turn so region changes are picked up.
+local dist_cache = {}
+local dist_cache_dirty = {}  -- faction keys that need recalculation next check
 
 local coalition_snapshots = {}
 local coalition_snapshot_turn = 0
@@ -128,10 +134,15 @@ end
 -- UTILITIES
 -- ============================================================================
 
-local function Dist(x1, y1, x2, y2)
+local function DistSq(x1, y1, x2, y2)
     local dx = x2 - x1
     local dy = y2 - y1
-    return math.sqrt(dx * dx + dy * dy)
+    return dx * dx + dy * dy
+end
+
+-- Keep Dist for any callers that need actual distance (coalition member proximity checks)
+local function Dist(x1, y1, x2, y2)
+    return math.sqrt(DistSq(x1, y1, x2, y2))
 end
 
 local function GetHumans()
@@ -1955,13 +1966,16 @@ end
 -- DISTANCE BLOCKING
 -- ============================================================================
 
-local function GetDistToHuman(ai_faction)
-    local min_dist = 99999
+local WAR_DISTANCE_THRESHOLD_SQ = WAR_DISTANCE_THRESHOLD * WAR_DISTANCE_THRESHOLD
+local FAR_DISTANCE_THRESHOLD_SQ = FAR_DISTANCE_THRESHOLD * FAR_DISTANCE_THRESHOLD
+
+local function CalcDistSqToHuman(ai_faction)
+    local min_dist_sq = 99999 * 99999
     local ai_regions = ai_faction:region_list()
 
     if ai_regions:num_items() == 0 then
         local forces = ai_faction:military_force_list()
-        if forces:num_items() == 0 then return min_dist end
+        if forces:num_items() == 0 then return min_dist_sq end
         for i = 0, forces:num_items() - 1 do
             local force = forces:item_at(i)
             if force:is_army() and force:has_general() then
@@ -1973,14 +1987,14 @@ local function GetDistToHuman(ai_faction)
                         local hregs = hfac:region_list()
                         for j = 0, hregs:num_items() - 1 do
                             local s = hregs:item_at(j):settlement()
-                            local d = Dist(ax, ay, s:logical_position_x(), s:logical_position_y())
-                            if d < min_dist then min_dist = d end
+                            local d = DistSq(ax, ay, s:logical_position_x(), s:logical_position_y())
+                            if d < min_dist_sq then min_dist_sq = d end
                         end
                     end
                 end
             end
         end
-        return min_dist
+        return min_dist_sq
     end
 
     for i = 0, ai_regions:num_items() - 1 do
@@ -1992,13 +2006,42 @@ local function GetDistToHuman(ai_faction)
                 local hregs = hfac:region_list()
                 for j = 0, hregs:num_items() - 1 do
                     local hs = hregs:item_at(j):settlement()
-                    local d = Dist(ax, ay, hs:logical_position_x(), hs:logical_position_y())
-                    if d < min_dist then min_dist = d end
+                    local d = DistSq(ax, ay, hs:logical_position_x(), hs:logical_position_y())
+                    if d < min_dist_sq then min_dist_sq = d end
                 end
             end
         end
     end
-    return min_dist
+    return min_dist_sq
+end
+
+local function GetDistToHuman(ai_faction)
+    local ai_key = ai_faction:name()
+
+    -- Return cached value if clean
+    if dist_cache[ai_key] and not dist_cache_dirty[ai_key] then
+        -- Return sqrt only for logging; internally we compare squared
+        return math.sqrt(dist_cache[ai_key])
+    end
+
+    local dist_sq = CalcDistSqToHuman(ai_faction)
+    dist_cache[ai_key] = dist_sq
+    dist_cache_dirty[ai_key] = nil
+    return math.sqrt(dist_sq)
+end
+
+-- Fast version used in CheckFaction — avoids sqrt entirely
+local function IsFactionFarFromHuman(ai_faction)
+    local ai_key = ai_faction:name()
+
+    if dist_cache[ai_key] and not dist_cache_dirty[ai_key] then
+        return dist_cache[ai_key] > WAR_DISTANCE_THRESHOLD_SQ
+    end
+
+    local dist_sq = CalcDistSqToHuman(ai_faction)
+    dist_cache[ai_key] = dist_sq
+    dist_cache_dirty[ai_key] = nil
+    return dist_sq > WAR_DISTANCE_THRESHOLD_SQ
 end
 
 local function BlockWar(ai_key)
@@ -2042,6 +2085,9 @@ local function CheckFaction(ai_faction)
         last_turn = turn
         checks, blocked, allowed = 0, 0, 0
         coalition_checked_this_turn = false
+        -- Invalidate distance cache each new turn so region changes are picked up
+        dist_cache = {}
+        dist_cache_dirty = {}
     end
 
     if not coalition_checked_this_turn then
@@ -2054,36 +2100,61 @@ local function CheckFaction(ai_faction)
         if not ok_c then Log("COALITION ERROR: " .. tostring(err_c)) end
     end
 
-    local prev = last_calc[ai_key] or 0
-    if (turn - prev) < RECALC_FREQUENCY then return end
-    last_calc[ai_key] = turn
     checks = checks + 1
 
+    -- Cascade peace must run every turn to catch the exact turn a war ends
     CheckCascadePeace(ai_faction)
-    CheckClientStateGrowth(ai_faction)
 
-    local dist = GetDistToHuman(ai_faction)
     local is_blocked = blocked_factions[ai_key] or false
 
-    if dist > WAR_DISTANCE_THRESHOLD then
+    -- Determine check frequency for this faction:
+    -- Very distant blocked factions change slowly, check less often
+    local faction_freq = SLOW_CHECK_FREQUENCY
+    if is_blocked and not coalition_war_overrides[ai_key] then
+        local cached_dist_sq = dist_cache[ai_key]
+        if cached_dist_sq and cached_dist_sq > FAR_DISTANCE_THRESHOLD_SQ then
+            faction_freq = FAR_CHECK_FREQUENCY
+        end
+    end
+
+    local is_slow_turn = (turn % faction_freq) == (math.abs(ai_key:byte(1)) % faction_freq)
+    local is_growth_turn = (turn % SLOW_CHECK_FREQUENCY) == (math.abs(ai_key:byte(1)) % SLOW_CHECK_FREQUENCY)
+
+    -- Client state growth always uses SLOW_CHECK_FREQUENCY regardless of distance
+    if is_growth_turn then
+        CheckClientStateGrowth(ai_faction)
+    end
+
+    -- Skip distance check for already-blocked distant factions
+    if is_blocked and not coalition_war_overrides[ai_key] then
+        if not is_slow_turn then
+            blocked = blocked + 1
+            return
+        end
+    end
+
+    local is_far = IsFactionFarFromHuman(ai_faction)
+    is_blocked = blocked_factions[ai_key] or false
+
+    if is_far then
         if coalition_war_overrides[ai_key] then
             if is_blocked then
                 EnableWar(ai_key)
-                Log(ai_key .. " is FAR (dist=" .. math.floor(dist) .. ") but COALITION OVERRIDE active")
+                Log(ai_key .. " is FAR but COALITION OVERRIDE active")
             end
             allowed = allowed + 1
         else
             blocked = blocked + 1
             if not is_blocked then
                 BlockWar(ai_key)
-                Log(ai_key .. " is FAR (dist=" .. math.floor(dist) .. ") - WAR BLOCKED")
+                Log(ai_key .. " is FAR - WAR BLOCKED")
             end
         end
     else
         allowed = allowed + 1
         if is_blocked then
             EnableWar(ai_key)
-            Log(ai_key .. " is CLOSE (dist=" .. math.floor(dist) .. ") - WAR ENABLED")
+            Log(ai_key .. " is CLOSE - WAR ENABLED")
         end
     end
 end
@@ -2959,6 +3030,7 @@ local function OnFactionTurn(context)
         end
     end
 
+
     if fac:is_human() then return end
     if not fac:has_home_region() then return end
 
@@ -2982,7 +3054,8 @@ local loaded_from_save = false
 local function OnLoad(context)
     human_factions = {}
     blocked_factions = {}
-    last_calc = {}
+    dist_cache = {}
+    dist_cache_dirty = {}
     coalition_reapplied_after_load = false
     coalition_checked_this_turn = false
     cascade_wars_previous = {}
@@ -3001,7 +3074,6 @@ local function OnNewCampaign(context)
     end
     human_factions = {}
     blocked_factions = {}
-    last_calc = {}
     coalition_snapshots = {}
     coalition_snapshot_turn = 0
     coalition_cooldowns = {}
