@@ -504,3 +504,4 @@ rom_useless_bureauracy	true	Politicians are an egotistical lot. Although elected
 rom_young_challenger	true	Politicians and the public have both become enamoured by a great young orator, he is obviously ambitious and is gaining the favour of the rabble. Although he has yet to disparage you, he hasn't supported your endeavours either.  	Young Challenger	rom_event_document.png	rom_generic.png	false
 dei_dilemma_AI_OFFER_PEACE	true	An unofficial request of peace arrives in your realm.	Peace Offer	rom_event_document.png	rom_politics.png	true
 dei_dilemma_COALITION_INVITE	true	Neighboring factions seek your military support.	Coalition Invitation	rom_event_document.png	rom_politics.png	true
+dei_dilemma_MEMBER_THREAT	true	A coalition member has grown dangerously powerful.	Rising Threat	rom_event_document.png	rom_politics.png	true
