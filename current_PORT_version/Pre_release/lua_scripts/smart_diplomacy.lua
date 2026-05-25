@@ -84,7 +84,7 @@ local coalition_new_formation = false  -- true when coalition JUST formed (wars 
 
 -- peace offer dilemma system (AI offers peace to player via popup)
 local pending_player_peace_offers = {}   -- queued offers: [{asker_key, player_key, turn}]
-local cascade_wars_previous = {}         -- faction_key -> {enemy_key = true} snapshot from last turn (for cascade detection)
+local faction_wars_at_turn_start = {}    -- faction_key -> {enemy_key = true} snapshot taken at FactionTurnStart
 local awaiting_peace_response = nil       -- active dilemma waiting for response: {asker_key, player_key, turn}
 local PLAYER_PEACE_DILEMMA_COOLDOWN = 5   -- min turns between peace offer popups
 local last_peace_dilemma_turn = 0
@@ -323,24 +323,41 @@ end
 
 -- ============================================================================
 -- CASCADING PEACE
+-- Called from OnFactionTurnEnd. For a given overlord faction A that ended a
+-- ============================================================================
+-- CASCADING PEACE
+--
+-- Two distinct cases handled at FactionTurnEnd:
+--
+-- NORMAL PEACE (A and B make peace):
+--   A's clients <-> B
+--   B's clients <-> A
+--   A's clients <-> B's clients
+--   Overlords of A or B are NOT affected.
+--   No ally cascade — keeps scope contained.
+--
+-- SUBJUGATION (A subjugates B — B is now A's client):
+--   B gets a diplomacy reset: forced peace with all current enemies,
+--   EXCEPT factions that A is also at war with (shared enemies stay).
+--   B's alliances, NAPs, and client state treaties are dissolved.
+--   A and A's clients are unaffected — they keep their wars.
 -- ============================================================================
 
-local function CheckCascadePeace(ai_faction)
-    if not CASCADE_PEACE_ENABLED then return end
-    local ai_key = ai_faction:name()
-
-    -- =====================================================================
-    -- PASS 1: This faction is an OVERLORD — cascade peace DOWN to clients
-    -- ONLY cascade when the overlord RECENTLY ENDED a war with enemy X
-    -- (was at war last turn, not at war this turn). Never cascade if the
-    -- overlord was NEVER at war with that enemy.
-    -- =====================================================================
+local function GetClientStatesAll(faction_key)
     local clients = {}
     pcall(function()
-        local ai_treaties = ai_faction:treaty_details()
-        if not ai_treaties then return end
-        local my_regions = ai_faction:region_list():num_items()
-        for other_faction, treaty_list in pairs(ai_treaties) do
+        local fac = scripting.game_interface:model():world():faction_by_key(faction_key)
+        if not fac then
+            Log("CASCADE PEACE (GetClientStatesAll): " .. faction_key .. " — faction not found")
+            return
+        end
+        local my_regions = fac:region_list():num_items()
+        local treaties = fac:treaty_details()
+        if not treaties then
+            Log("CASCADE PEACE (GetClientStatesAll): " .. faction_key .. " — no treaty_details")
+            return
+        end
+        for other_faction, treaty_list in pairs(treaties) do
             local other_key = GetFactionKey(other_faction)
             if other_key and type(treaty_list) == "table" then
                 for _, treaty in ipairs(treaty_list) do
@@ -349,159 +366,283 @@ local function CheckCascadePeace(ai_faction)
                     or treaty == "current_treaty_vassal"
                     or treaty == "current_treaty_vassal_of_player" then
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
-                        if other_fac and not IsHumanFaction(other_key) and other_fac:region_list():num_items() < my_regions then
-                            clients[other_key] = true
+                        if other_fac then
+                            local other_regions = other_fac:region_list():num_items()
+                            if other_regions < my_regions then
+                                table.insert(clients, other_key)
+                                Log("CASCADE PEACE (GetClientStatesAll): " .. faction_key
+                                    .. " -> client " .. other_key
+                                    .. " (" .. other_regions .. " vs " .. my_regions .. " regions, treaty=" .. treaty .. ")")
+                            else
+                                Log("CASCADE PEACE (GetClientStatesAll): " .. faction_key
+                                    .. " -> REJECTED " .. other_key
+                                    .. " (regions " .. other_regions .. " >= " .. my_regions .. ", treaty=" .. treaty .. ")")
+                            end
+                        else
+                            Log("CASCADE PEACE (GetClientStatesAll): " .. faction_key
+                                .. " -> REJECTED " .. other_key .. " (faction object not found, treaty=" .. treaty .. ")")
                         end
                         break
-                    end
-                    if CASCADE_FROM_ALLIES then
-                        if treaty == "current_treaty_military_alliance"
-                        or treaty == "current_treaty_defensive_alliance" then
-                            clients[other_key] = true
-                            break
-                        end
                     end
                 end
             end
         end
     end)
+    Log("CASCADE PEACE (GetClientStatesAll): " .. faction_key .. " — found " .. #clients .. " clients")
+    return clients
+end
 
-    if next(clients) then
-        local overlord_wars_current = GetWarsForFaction(ai_key)
-        local overlord_wars_previous = cascade_wars_previous[ai_key] or {}
-
-        -- Find wars the overlord ENDED this turn (was at war before, not now)
-        local ended_wars = {}
-        for enemy_key, _ in pairs(overlord_wars_previous) do
-            if not overlord_wars_current[enemy_key] then
-                ended_wars[enemy_key] = true
+local function IsCoalitionBlocked(faction_key_a, faction_key_b)
+    for _, coal in ipairs(active_coalitions) do
+        if coal.threat_key == faction_key_a then
+            for _, member_key in ipairs(coal.members) do
+                if member_key == faction_key_b then return true end
             end
         end
-
-        -- Update snapshot for next turn
-        cascade_wars_previous[ai_key] = overlord_wars_current
-
-        -- Only cascade for ENDED wars, not "was never at war"
-        if next(ended_wars) then
-            for client_key, _ in pairs(clients) do
-                if IsHumanFaction(client_key) then
-                    Log("CASCADE PEACE: Skipping human client " .. client_key .. " (player controls own diplomacy)")
-                else
-                    local client_wars = GetWarsForFaction(client_key)
-                    for enemy_key, _ in pairs(client_wars) do
-                        if ended_wars[enemy_key] and enemy_key ~= ai_key then
-                            if IsHumanFaction(enemy_key) then
-                                Log("CASCADE PEACE: Skipping " .. client_key .. " <-> " .. enemy_key .. " (will not force peace on human player)")
-                            else
-                                -- Block cascade if enemy is a coalition member targeting this client
-                                local is_coalition_member = false
-                                for _, coal in ipairs(active_coalitions) do
-                                    if coal.threat_key == client_key then
-                                        for _, member_key in ipairs(coal.members) do
-                                            if member_key == enemy_key then
-                                                is_coalition_member = true
-                                                break
-                                            end
-                                        end
-                                    end
-                                    if is_coalition_member then break end
-                                end
-
-                                if not is_coalition_member then
-                                    pcall(function()
-                                        cm:force_make_peace(client_key, enemy_key)
-                                    end)
-                                    Log("CASCADE PEACE: " .. client_key .. " <-> " .. enemy_key
-                                        .. " (overlord " .. ai_key .. " ended war this turn)")
-                                else
-                                    Log("CASCADE PEACE: BLOCKED " .. client_key .. " <-> " .. enemy_key
-                                        .. " (active coalition member vs " .. client_key .. ")")
-                                end
-                            end
-                        end
-                    end
-                end
+        if coal.threat_key == faction_key_b then
+            for _, member_key in ipairs(coal.members) do
+                if member_key == faction_key_a then return true end
             end
         end
-    else
-        -- Not an overlord — still snapshot wars for future comparison
-        cascade_wars_previous[ai_key] = GetWarsForFaction(ai_key)
+    end
+    return false
+end
+
+local function TryMakePeace(key_a, key_b, reason)
+    if key_a == key_b then return end
+    if IsCoalitionBlocked(key_a, key_b) then
+        Log("CASCADE PEACE: BLOCKED " .. key_a .. " <-> " .. key_b .. " (active coalition)")
+        return
+    end
+    if not AreAtWar(key_a, key_b) then
+        Log("CASCADE PEACE: Skipping " .. key_a .. " <-> " .. key_b .. " (not at war)")
+        return
+    end
+    pcall(function() cm:force_make_peace(key_a, key_b) end)
+    Log("CASCADE PEACE: " .. key_a .. " <-> " .. key_b .. " (" .. reason .. ")")
+end
+
+-- Normal peace: A and B made peace. Cascade to their client states only.
+-- Overlords of A or B are not touched. No ally cascade.
+local function CascadeNormalPeace(faction_a, faction_b)
+    Log("CASCADE PEACE (normal): " .. faction_a .. " <-> " .. faction_b)
+
+    local clients_a = GetClientStatesAll(faction_a)
+    local clients_b = GetClientStatesAll(faction_b)
+
+    Log("CASCADE PEACE (normal): " .. faction_a .. " has " .. #clients_a .. " clients | "
+        .. faction_b .. " has " .. #clients_b .. " clients")
+
+    -- A's clients <-> B
+    for _, client_key in ipairs(clients_a) do
+        TryMakePeace(client_key, faction_b,
+            "client of " .. faction_a .. " inherits peace with " .. faction_b)
     end
 
-    -- =====================================================================
-    -- PASS 2: This faction is a CLIENT — find overlord and inherit their peace
-    -- Same fix: only cascade if overlord ENDED a war this turn
-    -- =====================================================================
-    local overlord_key = nil
+    -- B's clients <-> A
+    for _, client_key in ipairs(clients_b) do
+        TryMakePeace(client_key, faction_a,
+            "client of " .. faction_b .. " inherits peace with " .. faction_a)
+    end
+
+    -- A's clients <-> B's clients
+    for _, ca in ipairs(clients_a) do
+        for _, cb in ipairs(clients_b) do
+            TryMakePeace(ca, cb,
+                "client of " .. faction_a .. " <-> client of " .. faction_b)
+        end
+    end
+end
+
+-- Subjugation: conqueror A subjugated B (B is now A's client).
+-- B gets a diplomacy reset — forced peace with all enemies except shared ones.
+-- B's alliances, NAPs, and own client states are dissolved.
+local function CascadeSubjugation(conqueror_key, subjugated_key)
+    Log("CASCADE PEACE (subjugation): " .. subjugated_key .. " subjugated by " .. conqueror_key)
+
+    -- Build the set of factions A is currently at war with (shared enemies — B keeps these)
+    local conqueror_wars = GetWarsForFaction(conqueror_key)
+    local conqueror_client_wars = {}
+    for _, ck in ipairs(GetClientStatesAll(conqueror_key)) do
+        for enemy_key, _ in pairs(GetWarsForFaction(ck)) do
+            conqueror_client_wars[enemy_key] = true
+        end
+    end
+
+    Log("CASCADE PEACE (subjugation): " .. conqueror_key .. " is at war with "
+        .. (function() local n=0; for _ in pairs(conqueror_wars) do n=n+1 end; return n end)()
+        .. " factions (shared enemies — B keeps these)")
+
+    -- Force peace for B with all current enemies, except shared ones
+    local subjugated_wars = GetWarsForFaction(subjugated_key)
+    for enemy_key, _ in pairs(subjugated_wars) do
+        if enemy_key == conqueror_key then
+            -- Already resolved by the subjugation itself
+            Log("CASCADE PEACE (subjugation): Skipping " .. subjugated_key .. " <-> " .. conqueror_key .. " (subjugator)")
+        elseif conqueror_wars[enemy_key] or conqueror_client_wars[enemy_key] then
+            Log("CASCADE PEACE (subjugation): Keeping " .. subjugated_key .. " <-> " .. enemy_key .. " (shared enemy of " .. conqueror_key .. ")")
+        else
+            TryMakePeace(subjugated_key, enemy_key,
+                subjugated_key .. " reset after subjugation by " .. conqueror_key)
+        end
+    end
+
+    -- Dissolve B's alliances and NAPs with third parties
     pcall(function()
-        local my_regions = ai_faction:region_list():num_items()
-        local ai_treaties = ai_faction:treaty_details()
-        if not ai_treaties then return end
-        for other_faction, treaty_list in pairs(ai_treaties) do
+        local subj_fac = scripting.game_interface:model():world():faction_by_key(subjugated_key)
+        if not subj_fac then return end
+        local treaties = subj_fac:treaty_details()
+        if not treaties then return end
+        for other_faction, treaty_list in pairs(treaties) do
             local other_key = GetFactionKey(other_faction)
-            if other_key and other_key ~= ai_key and type(treaty_list) == "table" then
+            if other_key and other_key ~= conqueror_key and type(treaty_list) == "table" then
                 for _, treaty in ipairs(treaty_list) do
+                    if treaty == "current_treaty_military_alliance"
+                    or treaty == "current_treaty_defensive_alliance"
+                    or treaty == "current_treaty_non_aggression" then
+                        pcall(function()
+                            scripting.game_interface:force_diplomacy(subjugated_key, other_key, "military alliance", false, false)
+                            scripting.game_interface:force_diplomacy(subjugated_key, other_key, "defensive alliance", false, false)
+                            scripting.game_interface:force_diplomacy(subjugated_key, other_key, "non aggression", false, false)
+                            scripting.game_interface:force_diplomacy(other_key, subjugated_key, "military alliance", false, false)
+                            scripting.game_interface:force_diplomacy(other_key, subjugated_key, "defensive alliance", false, false)
+                            scripting.game_interface:force_diplomacy(other_key, subjugated_key, "non aggression", false, false)
+                        end)
+                        Log("CASCADE PEACE (subjugation): Dissolved " .. treaty .. " between " .. subjugated_key .. " <-> " .. other_key)
+                        break
+                    end
+                    -- Dissolve B's own client states (B can't have subjects while being a subject)
                     if treaty == "current_treaty_client_state"
                     or treaty == "current_treaty_client_of_player"
                     or treaty == "current_treaty_vassal"
                     or treaty == "current_treaty_vassal_of_player" then
                         local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
-                        if other_fac and other_fac:region_list():num_items() > my_regions then
-                            overlord_key = other_key
+                        if other_fac then
+                            local other_regions = other_fac:region_list():num_items()
+                            local subj_regions = subj_fac:region_list():num_items()
+                            if other_regions < subj_regions then
+                                -- other_key is B's client — dissolve via war/peace cycle
+                                pcall(function()
+                                    scripting.game_interface:force_diplomacy(subjugated_key, other_key, "war", true, true)
+                                    scripting.game_interface:force_diplomacy(other_key, subjugated_key, "war", true, true)
+                                end)
+                                pcall(function() cm:force_declare_war(subjugated_key, other_key) end)
+                                pcall(function()
+                                    scripting.game_interface:force_diplomacy(subjugated_key, other_key, "peace", true, true)
+                                    scripting.game_interface:force_diplomacy(other_key, subjugated_key, "peace", true, true)
+                                end)
+                                pcall(function() cm:force_make_peace(subjugated_key, other_key) end)
+                                Log("CASCADE PEACE (subjugation): Released B's client " .. other_key .. " from " .. subjugated_key)
+                            end
                         end
                         break
                     end
                 end
             end
-            if overlord_key then return end
         end
     end)
+end
 
-    if overlord_key then
-        local overlord_wars_current = GetWarsForFaction(overlord_key)
-        local overlord_wars_previous = cascade_wars_previous[overlord_key] or {}
+local function SnapshotWarsAtTurnStart(faction_key)
+    faction_wars_at_turn_start[faction_key] = GetWarsForFaction(faction_key)
+    local n = 0
+    for _ in pairs(faction_wars_at_turn_start[faction_key]) do n = n + 1 end
+    Log("CASCADE PEACE (TurnStart): Snapshot taken for " .. faction_key .. " | wars=" .. n)
+end
 
-        -- Find wars the overlord ENDED
-        local ended_wars = {}
-        for enemy_key, _ in pairs(overlord_wars_previous) do
-            if not overlord_wars_current[enemy_key] then
-                ended_wars[enemy_key] = true
-            end
-        end
+-- ============================================================================
+-- FACTION TURN END — CASCADE PEACE
+-- Snapshot wars at FactionTurnStart, compare at FactionTurnEnd.
+-- Wars that ended this turn are classified as normal peace or subjugation,
+-- then the appropriate cascade fires.
+-- ============================================================================
 
-        -- Update snapshot
-        cascade_wars_previous[overlord_key] = overlord_wars_current
+local function IsSubjugatedBy(subjugated_key, conqueror_key)
+    local result = false
+    pcall(function()
+        local subj_fac = scripting.game_interface:model():world():faction_by_key(subjugated_key)
+        local conq_fac = scripting.game_interface:model():world():faction_by_key(conqueror_key)
+        if not subj_fac or not conq_fac then return end
+        local subj_regions = subj_fac:region_list():num_items()
+        local conq_regions = conq_fac:region_list():num_items()
+        if subj_regions >= conq_regions then return end  -- must be smaller to be a client
 
-        if next(ended_wars) then
-            local ai_wars = GetWarsForFaction(ai_key)
-            for enemy_key, _ in pairs(ai_wars) do
-                if ended_wars[enemy_key] and enemy_key ~= overlord_key then
-                    -- Block cascade if enemy is a coalition member targeting this faction
-                    local is_coalition_member = false
-                    for _, coal in ipairs(active_coalitions) do
-                        if coal.threat_key == ai_key then
-                            for _, member_key in ipairs(coal.members) do
-                                if member_key == enemy_key then
-                                    is_coalition_member = true
-                                    break
-                                end
-                            end
-                        end
-                        if is_coalition_member then break end
-                    end
-
-                    if not is_coalition_member then
-                        pcall(function()
-                            cm:force_make_peace(ai_key, enemy_key)
-                        end)
-                        Log("CASCADE PEACE: " .. ai_key .. " <-> " .. enemy_key
-                            .. " (overlord " .. overlord_key .. " ended war this turn)")
-                    else
-                        Log("CASCADE PEACE: BLOCKED " .. ai_key .. " <-> " .. enemy_key
-                            .. " (active coalition member vs " .. ai_key .. ")")
+        local treaties = subj_fac:treaty_details()
+        if not treaties then return end
+        for other_faction, treaty_list in pairs(treaties) do
+            local tkey = GetFactionKey(other_faction)
+            if tkey == conqueror_key and type(treaty_list) == "table" then
+                for _, treaty in ipairs(treaty_list) do
+                    if treaty == "current_treaty_client_state"
+                    or treaty == "current_treaty_client_of_player"
+                    or treaty == "current_treaty_vassal"
+                    or treaty == "current_treaty_vassal_of_player" then
+                        result = true
+                        break
                     end
                 end
             end
+            if result then break end
+        end
+    end)
+    return result
+end
+
+local function OnFactionTurnEnd(context)
+    if not CASCADE_PEACE_ENABLED then return end
+    local fac = context:faction()
+    if not fac:has_home_region() then return end
+
+    local faction_key = fac:name()
+    local wars_at_start = faction_wars_at_turn_start[faction_key]
+    faction_wars_at_turn_start[faction_key] = nil  -- clear snapshot
+
+    if not wars_at_start then
+        Log("CASCADE PEACE (TurnEnd): No start snapshot for " .. faction_key .. " — skipping")
+        return
+    end
+
+    local wars_at_end = GetWarsForFaction(faction_key)
+
+    -- Find wars that ended during this faction's turn
+    local ended_wars = {}
+    for enemy_key, _ in pairs(wars_at_start) do
+        if not wars_at_end[enemy_key] then
+            ended_wars[enemy_key] = true
+        end
+    end
+
+    local start_count = 0
+    for _ in pairs(wars_at_start) do start_count = start_count + 1 end
+    local end_count = 0
+    for _ in pairs(wars_at_end) do end_count = end_count + 1 end
+    local ended_count = 0
+    for _ in pairs(ended_wars) do ended_count = ended_count + 1 end
+
+    Log("CASCADE PEACE (TurnEnd): " .. faction_key
+        .. " | wars_start=" .. start_count
+        .. " wars_end=" .. end_count
+        .. " ended=" .. ended_count)
+
+    if not next(ended_wars) then return end
+
+    for enemy_key, _ in pairs(ended_wars) do
+        Log("CASCADE PEACE (TurnEnd): " .. faction_key .. " ended war with " .. enemy_key)
+
+        -- Classify: subjugation or normal peace
+        -- Check both directions — either side could be the conqueror
+        if IsSubjugatedBy(enemy_key, faction_key) then
+            -- faction_key subjugated enemy_key
+            Log("CASCADE PEACE (TurnEnd): Classified as SUBJUGATION — " .. faction_key .. " conquered " .. enemy_key)
+            CascadeSubjugation(faction_key, enemy_key)
+        elseif IsSubjugatedBy(faction_key, enemy_key) then
+            -- enemy_key subjugated faction_key (e.g. player was subjugated)
+            Log("CASCADE PEACE (TurnEnd): Classified as SUBJUGATION — " .. enemy_key .. " conquered " .. faction_key)
+            CascadeSubjugation(enemy_key, faction_key)
+        else
+            -- Normal peace
+            Log("CASCADE PEACE (TurnEnd): Classified as NORMAL PEACE — " .. faction_key .. " <-> " .. enemy_key)
+            CascadeNormalPeace(faction_key, enemy_key)
         end
     end
 end
@@ -1284,17 +1425,57 @@ local function CheckCoalitionDissolution()
         local coal = active_coalitions[i]
         local threat_key = coal.threat_key
 
-        local peace_count = 0
-        for _, member_key in ipairs(coal.members) do
-            if not IsFactionAlive(member_key) or not AreAtWar(threat_key, member_key) then
-                peace_count = peace_count + 1
+        -- Check if the threat has been subjugated by any coalition member.
+        -- If so, the coalition succeeded — dissolve immediately.
+        local subjugated_by = nil
+        pcall(function()
+            local threat_fac = scripting.game_interface:model():world():faction_by_key(threat_key)
+            if not threat_fac or not threat_fac:has_home_region() then return end
+            local threat_regions = threat_fac:region_list():num_items()
+            local treaties = threat_fac:treaty_details()
+            if not treaties then return end
+            for other_faction, treaty_list in pairs(treaties) do
+                local other_key = GetFactionKey(other_faction)
+                if other_key and type(treaty_list) == "table" then
+                    for _, treaty in ipairs(treaty_list) do
+                        if treaty == "current_treaty_client_state"
+                        or treaty == "current_treaty_client_of_player"
+                        or treaty == "current_treaty_vassal"
+                        or treaty == "current_treaty_vassal_of_player" then
+                            -- Confirm direction: overlord must have more regions
+                            local other_fac = scripting.game_interface:model():world():faction_by_key(other_key)
+                            if other_fac and other_fac:region_list():num_items() > threat_regions then
+                                -- Check if the overlord is one of the coalition members
+                                for _, member_key in ipairs(coal.members) do
+                                    if member_key == other_key then
+                                        subjugated_by = member_key
+                                        break
+                                    end
+                                end
+                            end
+                            break
+                        end
+                    end
+                end
+                if subjugated_by then break end
             end
-        end
+        end)
 
-        local dissolve_threshold = math.ceil(#coal.members * COALITION_DISSOLVE_RATIO)
+        if subjugated_by then
+            DissolveCoalition(i, "threat " .. threat_key .. " was subjugated by coalition member " .. subjugated_by)
+        else
+            local peace_count = 0
+            for _, member_key in ipairs(coal.members) do
+                if not IsFactionAlive(member_key) or not AreAtWar(threat_key, member_key) then
+                    peace_count = peace_count + 1
+                end
+            end
 
-        if peace_count >= dissolve_threshold then
-            DissolveCoalition(i, "peace with " .. peace_count .. "/" .. #coal.members .. " members (threshold: " .. dissolve_threshold .. ")")
+            local dissolve_threshold = math.ceil(#coal.members * COALITION_DISSOLVE_RATIO)
+
+            if peace_count >= dissolve_threshold then
+                DissolveCoalition(i, "peace with " .. peace_count .. "/" .. #coal.members .. " members (threshold: " .. dissolve_threshold .. ")")
+            end
         end
     end
 end
@@ -2102,9 +2283,6 @@ local function CheckFaction(ai_faction)
 
     checks = checks + 1
 
-    -- Cascade peace must run every turn to catch the exact turn a war ends
-    CheckCascadePeace(ai_faction)
-
     local is_blocked = blocked_factions[ai_key] or false
 
     -- Determine check frequency for this faction:
@@ -2471,6 +2649,23 @@ local function TryInjectPeaceOfferText()
             return
         end
 
+        -- Guard: only inject when the open dilemma is OUR peace-offer dilemma.
+        -- Check the dilemma title so we don't corrupt unrelated dilemma popups.
+        -- An empty title means the panel just opened and hasn't populated yet —
+        -- allow injection in that case (we know we just fired our dilemma).
+        local tx_title = FindUIComponent(ui_root, "event_dilemma", "tx_title")
+        if tx_title then
+            local title_text = tx_title:GetStateText() or ""
+            if title_text ~= "" and not string.find(title_text, "Peace") and not string.find(title_text, "Offer") then
+                Log("PEACE OFFER UI: Dilemma title '" .. title_text .. "' is not a peace offer — skipping injection")
+                return
+            end
+        else
+            -- If we can't find the title, the dilemma panel may not be open at all
+            Log("PEACE OFFER UI: Could not find event_dilemma > tx_title — panel may not be open, skipping")
+            return
+        end
+
         -- Navigate to: event_dilemma > description > dy_descr_text
         local dy_descr = FindUIComponent(ui_root, "event_dilemma", "description", "dy_descr_text")
         if dy_descr then
@@ -2518,6 +2713,22 @@ local function TryInjectCoalitionInviteText()
         local ok_v, _ = pcall(function() return ui_root:Id() end)
         if not ok_v then cached_ui_root = nil; return end
 
+        -- Guard: only inject when the open dilemma is OUR coalition invite dilemma.
+        -- An empty title means the panel just opened and hasn't populated yet —
+        -- allow injection in that case (we know we just fired our dilemma).
+        local tx_title = FindUIComponent(ui_root, "event_dilemma", "tx_title")
+        if tx_title then
+            local title_text = tx_title:GetStateText() or ""
+            if title_text ~= "" and not string.find(title_text, "Coalition") and not string.find(title_text, "Invite") and not string.find(title_text, "Alliance") then
+                Log("COALITION INVITE UI: Dilemma title '" .. title_text .. "' is not a coalition invite — skipping injection")
+                return
+            end
+        else
+            -- If we can't find the title, the dilemma panel may not be open at all
+            Log("COALITION INVITE UI: Could not find event_dilemma > tx_title — panel may not be open, skipping")
+            return
+        end
+
         -- Inject description text
         local dy_descr = FindUIComponent(ui_root, "event_dilemma", "description", "dy_descr_text")
         if dy_descr then
@@ -2548,6 +2759,12 @@ local panel_listener_registered = false
 
 local function OnFactionTurn(context)
     local fac = context:faction()
+
+    -- Snapshot wars for every faction at turn start — used by OnFactionTurnEnd
+    -- to detect which wars ended during this turn and trigger cascade peace.
+    if fac:has_home_region() then
+        SnapshotWarsAtTurnStart(fac:name())
+    end
 
     -- Register panel listener once (needs scripting to be available)
     if not panel_listener_registered then
@@ -2590,19 +2807,22 @@ local function OnFactionTurn(context)
                         local current = UIComponent(click_context.component)
 
                         -- PEACE OFFER: Detect Accept/Refuse click on dilemma buttons
-                        -- ONLY trigger on actual dilemma_button clicks, not the whole window area
-                        -- First check if dilemma_button is in the parent chain, THEN determine which window
+                        -- Walk up the component tree from the clicked element.
+                        -- We need to find both dilemma_button AND which window it belongs to.
+                        -- dilemma_button is a child of dilemma1_window/dilemma2_window, so
+                        -- walking up we hit dilemma_button first, then the window on the next step.
                         if awaiting_peace_response and not peace_offer_player_choice then
                             local walk = current
                             local found_button = false
-                            for depth = 1, 10 do
+                            for depth = 1, 12 do
                                 local ok_id, cid = pcall(function() return walk:Id() end)
                                 if ok_id and cid then
                                     if cid == "dilemma_button" then
                                         found_button = true
-                                    end
-                                    -- Only register choice if we already passed through dilemma_button
-                                    if found_button then
+                                        -- Don't check window name on this iteration —
+                                        -- the window is the parent, check on next step
+                                    elseif found_button then
+                                        -- We passed through dilemma_button, now check which window
                                         if cid == "dilemma1_window" then
                                             peace_offer_player_choice = true
                                             Log("PEACE OFFER CLICK: Player clicked ACCEPT (dilemma_button in dilemma1_window)")
@@ -2624,13 +2844,12 @@ local function OnFactionTurn(context)
                         if pending_coalition_invite and coalition_invite_dilemma_fired and coalition_invite_player_choice == nil then
                             local walk = current
                             local found_button = false
-                            for depth = 1, 10 do
+                            for depth = 1, 12 do
                                 local ok_id, cid = pcall(function() return walk:Id() end)
                                 if ok_id and cid then
                                     if cid == "dilemma_button" then
                                         found_button = true
-                                    end
-                                    if found_button then
+                                    elseif found_button then
                                         if cid == "dilemma1_window" then
                                             coalition_invite_player_choice = true
                                             Log("COALITION INVITE CLICK: Player clicked JOIN (dilemma_button in dilemma1_window)")
@@ -2971,6 +3190,8 @@ local function OnFactionTurn(context)
                     end)
                     if ok_dilemma then
                         Log("PEACE OFFER: Fired dei_dilemma_AI_OFFER_PEACE — " .. offer.asker_key .. " offers peace to " .. offer.player_key)
+                        -- Inject immediately — title may be empty when PanelOpenedCampaign fires
+                        TryInjectPeaceOfferText()
                     else
                         Log("PEACE OFFER ERROR: trigger_custom_dilemma failed: " .. tostring(err_dilemma))
                         awaiting_peace_response = nil
@@ -3017,6 +3238,8 @@ local function OnFactionTurn(context)
         end)
         if ok_dilemma then
             Log("COALITION INVITE: Fired dei_dilemma_COALITION_INVITE — " .. member_list .. " invite " .. player_key .. " vs " .. invite.threat_key)
+            -- Inject immediately — title may be empty when PanelOpenedCampaign fires
+            TryInjectCoalitionInviteText()
         else
             Log("COALITION INVITE ERROR: trigger_custom_dilemma failed: " .. tostring(err_dilemma))
             -- Form coalition without player
@@ -3058,7 +3281,7 @@ local function OnLoad(context)
     dist_cache_dirty = {}
     coalition_reapplied_after_load = false
     coalition_checked_this_turn = false
-    cascade_wars_previous = {}
+    faction_wars_at_turn_start = {}
     LoadCoalitionData(context)
     loaded_from_save = true
     Log("game loaded - coalition data restored")
@@ -3083,7 +3306,7 @@ local function OnNewCampaign(context)
     active_coalitions = {}
     coalition_reapplied_after_load = true
     coalition_checked_this_turn = false
-    cascade_wars_previous = {}
+    faction_wars_at_turn_start = {}
     pending_player_peace_offers = {}
     awaiting_peace_response = nil
     last_peace_dilemma_turn = 0
@@ -3180,5 +3403,6 @@ scripting.AddEventCallBack("WorldCreated", OnNewCampaign)
 scripting.AddEventCallBack("LoadingGame", OnLoad)
 scripting.AddEventCallBack("SavingGame", OnSave)
 scripting.AddEventCallBack("FactionTurnStart", OnFactionTurn)
+scripting.AddEventCallBack("FactionTurnEnd", OnFactionTurnEnd)
 Log("smart diplomacy loaded (cascade_peace=" .. tostring(CASCADE_PEACE_ENABLED)
     .. " coalition=" .. tostring(COALITION_ENABLED) .. ")")
