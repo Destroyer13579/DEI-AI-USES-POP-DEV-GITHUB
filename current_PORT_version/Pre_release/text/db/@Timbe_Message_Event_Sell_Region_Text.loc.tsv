@@ -1,0 +1,10 @@
+key	text	tooltip
+#Loc;1;text/db/@Timbe_Message_Event_Sell_Region_Text.loc		
+message_event_text_text_Sell_settlement_minor_neutral	This Minor region has now been sold at the price of 8000 talents!	true
+message_event_text_text_Sell_settlement_minor_allied	This Minor region has now been sold at the price of 10000 talents!	true
+message_event_text_text_Sell_settlement_major_neutral	This Major region has now been sold at the price of 16000 talents!	true
+message_event_text_text_Sell_settlement_major_allied	This Major region has now been sold at the price of 20000 talents!	true
+message_event_text_text_Sell_settlement_major_client	This Major region has now been sold at the price of 24000 talents!	true
+message_event_text_text_Sell_settlement_minor_client	This Minor region has now been sold at the price of 12000 talents!	true
+message_event_text_text_Region_to_be_selled	This region is now to be selled. Select a factions settlement (any settlement) and press the sell button to initiate transaction to that settlements faction.	true
+message_event_text_text_Region_selled	This region is now to be selled to another faction. The transaction happens at the start of your next turn.	true

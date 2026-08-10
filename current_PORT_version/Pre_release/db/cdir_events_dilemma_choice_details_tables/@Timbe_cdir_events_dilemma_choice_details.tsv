@@ -1,0 +1,10 @@
+choice_key	dilemma_key
+#cdir_events_dilemma_choice_details_tables;0;db/cdir_events_dilemma_choice_details_tables/@Timbe_cdir_events_dilemma_choice_details	
+FIRST	trade_region_interface_2500
+SECOND	trade_region_interface_2500
+FIRST	trade_region_interface_5000
+SECOND	trade_region_interface_5000
+FIRST	trade_region_interface_20000
+FIRST	trade_region_interface_10000
+SECOND	trade_region_interface_20000
+SECOND	trade_region_interface_10000

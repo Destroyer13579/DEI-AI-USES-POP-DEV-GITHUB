@@ -1,0 +1,12 @@
+key	localised_description	localised_title	ui_icon	bundle_target
+#effect_bundles_tables;1;db/effect_bundles_tables/@Timbe_Supply_System_effect_bundles				
+Region_Trade_Deal_2500	Region_Trade_Deal	Region_Trade_Deal	send_diplomat_positive.png	faction
+Region_Trade_Deal_10000	Region_Trade_Deal	Region_Trade_Deal	send_diplomat_positive.png	faction
+Region_Trade_Deal_20000	Region_Trade_Deal	Region_Trade_Deal	send_diplomat_positive.png	faction
+Region_Trade_Deal_5000	Region_Trade_Deal	Region_Trade_Deal	send_diplomat_positive.png	faction
+Region_Sold_8000	Payment for a purchased region.	Region Purchase	send_diplomat_positive.png	faction
+Region_Sold_10000	Payment for a purchased region.	Region Purchase	send_diplomat_positive.png	faction
+Region_Sold_12000	Payment for a purchased region.	Region Purchase	send_diplomat_positive.png	faction
+Region_Sold_16000	Payment for a purchased region.	Region Purchase	send_diplomat_positive.png	faction
+Region_Sold_20000	Payment for a purchased region.	Region Purchase	send_diplomat_positive.png	faction
+Region_Sold_24000	Payment for a purchased region.	Region Purchase	send_diplomat_positive.png	faction
