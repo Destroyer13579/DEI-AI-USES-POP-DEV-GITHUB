@@ -170,6 +170,11 @@ function SupplySystemStart(context, isSupplyConsumptionOn, isSupplyProductionOn)
 		Supply_Message = true;
 	end;
 
+	-- Early-out: skip factions with no armies and no regions (nothing to process)
+	if faction:military_force_list():num_items() == 0 and faction:region_list():num_items() == 0 then
+		return;
+	end;
+
 	LogSupply("SupplySystemStart(contextFaction,"..tostring(isSupplyConsumptionOn)..", "..tostring(isSupplyProductionOn)..")", "Start Supply System for "..faction:name(), true, false);
 	AlliedFactionKeys, EnemyFactionKeys = SupplyGetFactionTreaties(faction:treaty_details());
 

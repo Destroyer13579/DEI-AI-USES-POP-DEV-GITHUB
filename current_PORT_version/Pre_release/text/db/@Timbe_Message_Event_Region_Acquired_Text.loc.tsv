@@ -1,0 +1,8 @@
+key	text	tooltip
+#Loc;1;text/db/@Timbe_Message_Event_Region_Acquired_Text.loc		
+message_event_text_text_Region_acquired_via_diplomacy_minor	Your Diplomat indeed has a unique set of skills on negotiation! She has negotiated a deal to acquired a Minor Region at the cost of 10000 talents! Not a bad price at all.	true
+message_event_text_text_Region_acquired_via_diplomacy_major	Your Diplomat indeed has a unique set of skills on negotiation! She has negotiated a deal to acquired a Minor Region at the cost of 20000 talents! Not a bad price at all.	true
+message_event_text_text_Region_acquired_via_diplomacy_client_minor	Your Diplomat indeed has a unique set of skills on negotiation! She has negotiated a deal to acquired a Major Region at the cost of 2500 talents! Not a bad price at all.	true
+message_event_text_text_Region_acquired_via_diplomacy_client_major	Your Diplomat indeed has a unique set of skills on negotiation! She has negotiated a deal to acquired a Major Region at the cost of 5000 talents! Not a bad price at all.	true
+message_event_text_text_Region_diplomacy_expiration	The trade offer concerning this region has been expired. The owners of the region have decided that their interests on this matter lay elsewhere...	true
+message_event_text_text_Region_available_to_acquire	This region is available for you to acquire! Select your diplomat in this region to get further information about the terms concerning the possible transaction.	true

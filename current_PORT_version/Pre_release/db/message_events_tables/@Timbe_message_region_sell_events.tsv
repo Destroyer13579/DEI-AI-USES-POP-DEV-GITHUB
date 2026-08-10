@@ -1,0 +1,10 @@
+event	instant_open	layout	requires_response	priority
+#message_events_tables;1;db/message_events_tables/@Timbe_message_region_sell_events				
+custom_event_707	true	standard	false	110
+custom_event_706	true	standard	false	110
+custom_event_705	true	standard	false	110
+custom_event_704	true	standard	false	110
+custom_event_703	true	standard	false	110
+custom_event_702	true	standard	false	110
+custom_event_701	true	standard	false	110
+custom_event_708	true	standard	false	110

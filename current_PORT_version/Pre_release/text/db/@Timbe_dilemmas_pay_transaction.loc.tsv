@@ -1,0 +1,10 @@
+key	text	tooltip
+#Loc;1;text/db/@Timbe_dilemmas_pay_transaction.loc		
+dilemmas_localised_title_trade_region_interface_2500	You have purchased a region!	true
+dilemmas_localised_title_trade_region_interface_5000	You have purchased a region!	true
+dilemmas_localised_title_trade_region_interface_10000	You have purchased a region!	true
+dilemmas_localised_title_trade_region_interface_20000	You have purchased a region!	true
+dilemmas_localised_description_trade_region_interface_2500	Your Diplomat has acquired a region at the end of the last turn. Now it's time to pay for the transaction.	true
+dilemmas_localised_description_trade_region_interface_5000	Your Diplomat has acquired a region at the end of the last turn. Now it's time to pay for the transaction.	true
+dilemmas_localised_description_trade_region_interface_10000	Your Diplomat has acquired a region at the end of the last turn. Now it's time to pay for the transaction.	true
+dilemmas_localised_description_trade_region_interface_20000	Your Diplomat has acquired a region at the end of the last turn. Now it's time to pay for the transaction.	true

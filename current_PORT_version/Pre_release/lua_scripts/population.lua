@@ -3345,6 +3345,107 @@ function SetRegionOccupied()
 end
 
 
+-- ***** CONVERT POPULATION CLASSES ON PEACEFUL REGION TRANSFER ***** --
+-- Called after transfer_region_to_faction() for traded / sold regions
+-- (lua_scripts/trade_sell_regions_main.lua).
+--
+-- transfer_region_to_faction() does NOT raise GarrisonOccupiedEvent, so a traded
+-- region never reaches OnGarrisonOccupiedEventPop -> SetRegionOccupied(). Without
+-- this the new owner silently inherits the seller's class distribution.
+--
+-- Unlike SetRegionOccupied() this PRESERVES total population: a negotiated
+-- handover does not kill anyone. Only class composition shifts, and only when the
+-- new owner's state religion differs from the region's majority religion.
+--
+-- Deliberately does NOT call RecordRegionCapture(): a purchase is not war
+-- momentum and must not feed the diplomacy momentum system.
+--
+-- newFaction : faction interface of the new owner (may be nil -> resolved from the
+--              region, which is valid because the transfer has already happened)
+-- regionName : region key string
+-- returns    : true on success, false if it bailed out
+
+function ConvertPopulationClasses(newFaction, regionName)
+
+  if regionName == nil or regionName == "none" then
+    PopLog("aborted: no region name", "ConvertPopulationClasses()")
+    return false
+  end
+
+  if region_table[regionName] == nil or UIPopulation[regionName] == nil then
+    PopLog("aborted: no population data for " .. tostring(regionName), "ConvertPopulationClasses()")
+    return false
+  end
+
+  local ok, err = pcall(function()
+
+    local region = scripting.game_interface:model():world():region_manager():region_by_key(regionName)
+
+    -- the trade module uses the string "none" as an unresolved sentinel for its
+    -- faction globals, so normalise it away before treating newFaction as an interface
+    local owner = newFaction
+    if owner == nil or type(owner) == "string" then
+      owner = region:owning_faction()
+    end
+
+    local faction = owner
+    local factionName = faction:name()
+    local factionCulture = faction:state_religion()
+    local regionCulture = region:majority_religion()
+
+    -- keep ownership tracking honest straight away; UpdateRegionOwnershipTracking()
+    -- would also catch this, but not until the next turn start
+    ai_region_ownership[regionName] = factionName
+
+    if region_flag[regionName] ~= nil then
+      region_flag[regionName][SETTLEMENT_OCCUPIED] = true
+    end
+
+    if factionCulture == regionCulture then
+      PopLog("same-culture transfer, no class change: " .. regionName .. " -> " .. factionName, "ConvertPopulationClasses()")
+      return
+    end
+
+    -- different culture: shift part of the native elite into the foreign bucket,
+    -- conserving the total
+    local upper = region_table[regionName][1]
+    local mid   = region_table[regionName][2]
+    local lower = region_table[regionName][3]
+    local fgn   = region_table[regionName][4]
+    local before = upper + mid + lower + fgn
+
+    local movedUpper = math.floor(upper * 0.5)
+    local movedMid   = math.floor(mid * 0.5)
+
+    region_table[regionName][1] = upper - movedUpper
+    region_table[regionName][2] = mid - movedMid
+    region_table[regionName][3] = lower
+    region_table[regionName][4] = fgn + movedUpper + movedMid
+
+    local after = region_table[regionName][1] + region_table[regionName][2]
+               + region_table[regionName][3] + region_table[regionName][4]
+
+    UIPopulation[regionName][1] = region_table[regionName][1]
+    UIPopulation[regionName][2] = region_table[regionName][2]
+    UIPopulation[regionName][3] = region_table[regionName][3]
+    UIPopulation[regionName][4] = region_table[regionName][4]
+
+    PopLog("cross-culture transfer " .. regionName .. " -> " .. factionName
+        .. " total " .. before .. " -> " .. after
+        .. " (moved " .. (movedUpper + movedMid) .. " to foreign)", "ConvertPopulationClasses()")
+
+  end)
+
+  if not ok then
+    PopLog("ERROR: " .. tostring(err), "ConvertPopulationClasses()")
+    return false
+  end
+
+  return true
+
+end
+
+
 -- ***** ON FACTION TURN START POP ***** --
 -- add public order bundle fationwide based on proportion of foreign to citizens
 
@@ -11558,7 +11659,6 @@ end
 -- ***** DEEP COPY ***** --
 
 function deepCopy(orig)
-PopLog("deep Copy start for table: "..tostring(orig))
 -- copy background numbers to UI tables
   local orig_type = type(orig);
   local copy;
@@ -11573,7 +11673,6 @@ PopLog("deep Copy start for table: "..tostring(orig))
   else -- number, string, boolean, etc
     copy = orig;
   end;
-  PopLog("deep Copy start for table: returned value")
   return copy;
 end;
 
@@ -11802,4 +11901,18 @@ end
 -- Load faction rankings last so errors here don't affect population
 require "lua_scripts.faction_rankings"
 --scripting.AddEventCallBack("FactionTurnStart", FactionArmyIncrease);
+
+-- ***** TRADE / SELL REGIONS ENTRY POINT *****
+-- MrTimbe68's Trade_Regions is hooked in here rather than by forking DEI's
+-- campaigns/<name>/scripting.lua. Every DEI campaign (main_rome, main_emperor,
+-- main_gaul, main_greek, main_punic, main_invasion, main_3c) already does
+-- `require "lua_scripts.population"`, and this submod overrides population.lua,
+-- so this single line gives all-campaign coverage with zero forked DEI files.
+--
+-- It must stay at the very bottom: trade_sell_regions_main.lua requires
+-- population back, and module(..., package.seeall) has already registered this
+-- module in package.loaded, so by this point ConvertPopulationClasses() is
+-- defined and the cycle resolves without re-executing this file.
+require "lua_scripts.trade_sell_regions_main"
+
 -- #####---------------------------------- END #####
